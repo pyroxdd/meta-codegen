@@ -20,7 +20,7 @@ pass
         << "return false;" if durability == "0" else "return true;" >>
       } break;
 
-  out gen/tiles_generated.h
+  out server
     enum tile {
       <<enum>>
     }
