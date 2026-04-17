@@ -1,0 +1,33 @@
+pass
+  where
+    src/tiles/*.h
+
+  what
+    tile <<name>> {
+      texture = <<texture>>;
+      durability = <<durability>>;
+    }
+
+  init
+    count = 0
+    enum = []
+    hits = []
+
+  instance
+    enum += <<name>> = <<count++>>,
+    hits += 
+      case <<name>>: {
+        << "return false;" if durability == "0" else "return true;" >>
+      } break;
+
+  out gen/tiles_generated.h
+    enum tile {
+      <<enum>>
+    }
+
+    bool hit_tile(tile t) {
+      switch(t) {
+        <<hits>>
+        default: return false;
+      }
+    }
