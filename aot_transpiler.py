@@ -41,7 +41,7 @@ class PassDef:
 
 def parse_pass_file(source: str) -> dict[str, str]:
     section_re = re.compile(
-        r'^[ \t]*(pass|what|init|instance|out\s+\w+)\b',
+        r'^[ \t]*(pass|schema\s*\(\s*\)|schema|init\s*\(\s*\)|init|instance\s*\(\s*\)|instance|target\s*\(\s*\w+\s*\)|target\s+\w+)',
         re.MULTILINE,
     )
 
@@ -52,21 +52,35 @@ def parse_pass_file(source: str) -> dict[str, str]:
         end = positions[i + 1][1] if i + 1 < len(positions) else len(source)
         body = source[start:end]
 
-        key = name.split()[0]
-        if key == "out":
-            tag = name.split()[1]
-            key = f"out:{tag}"
+        key = re.match(r'\w+', name).group(0)
+        if key == "target":
+            tag_match = re.match(r'target(?:\s+|\s*\(\s*)(\w+)', name)
+            tag = tag_match.group(1)
+            key = f"target:{tag}"
 
-        body = re.sub(r'^[ \t]*' + re.escape(name) + r'[ \t]*\n?', '', body, count=1)
-        sections[key] = body
+        body = re.sub(r'^[ \t]*' + re.escape(name) + r'[ \t]*(?:\{\s*)?\n?', '', body, count=1)
+        sections[key] = unwrap_section_body(body)
 
     return sections
+
+
+def unwrap_section_body(body: str) -> str:
+    lines = body.strip().splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if lines and lines[-1].strip() == "}":
+        lines.pop()
+
+    return "\n".join(lines)
 
 
 def parse_out_sections(sections: dict[str, str]) -> dict[str, str]:
     outs = {}
     for key, body in sections.items():
-        if key.startswith("out:"):
+        if key.startswith("target:"):
             outs[key.split(":", 1)[1]] = body.strip()
     return outs
 
@@ -74,16 +88,16 @@ def parse_out_sections(sections: dict[str, str]) -> dict[str, str]:
 def parse_what_template(what_body: str) -> tuple[str, str, dict[str, str]]:
     lines = what_body.strip().splitlines()
     header = lines[0].strip()
-    m = re.match(r'(\w+)\s+<<(\w+)>>\s*\{', header)
+    m = re.match(r'(\w+)\s+\[(\w+)\]\s*\{', header)
     if not m:
-        raise ValueError(f"Invalid what header: {header!r}")
+        raise ValueError(f"Invalid schema header: {header!r}")
 
     fields = {}
     for line in lines[1:]:
         line = line.strip()
         if not line or line in ("{", "}"):
             continue
-        fm = re.match(r'(\w+)\s*=\s*<<(\w+)>>\s*;', line)
+        fm = re.match(r'(\w+)\s*=\s*\[(\w+)\]\s*;', line)
         if fm:
             fields[fm.group(1)] = fm.group(2)
 
@@ -136,7 +150,7 @@ def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
 
 def pass_name(pass_text: str, file: Path) -> str:
     first_line = pass_text.lstrip().splitlines()[0].strip()
-    m = re.match(r"pass\s+(\w+)\s*\{?\s*$", first_line)
+    m = re.match(r"pass\s+(\w+)\s*\{?\s*;?\s*$", first_line)
     if not m:
         raise ValueError(f"Expected $pass <name> in {file}")
     return m.group(1)
@@ -146,7 +160,7 @@ def unwrap_pass_block(pass_text: str) -> str:
     lines = pass_text.strip().splitlines()
     if lines and lines[0].strip().endswith("{"):
         lines[0] = lines[0].rstrip().removesuffix("{").rstrip()
-    if lines and lines[-1].strip() == "}":
+    if lines and lines[-1].strip() in ("}", "};"):
         lines.pop()
     return "\n".join(lines)
 
@@ -155,13 +169,13 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     pass_text = unwrap_pass_block(pass_text)
     name = pass_name(pass_text, file)
     sections = parse_pass_file(pass_text)
-    missing = [name for name in ("what", "init", "instance") if name not in sections]
+    missing = [name for name in ("schema", "init", "instance") if name not in sections]
     if missing:
         raise ValueError(f"$pass {name} is missing section(s): {', '.join(missing)}")
 
-    block_keyword, name_field, fields = parse_what_template(sections["what"])
+    block_keyword, name_field, fields = parse_what_template(sections["schema"])
     if block_keyword != name:
-        raise ValueError(f"$pass {name} has what block for {block_keyword}")
+        raise ValueError(f"$pass {name} has schema block for {block_keyword}")
 
     return PassDef(
         name=name,
@@ -178,7 +192,7 @@ def marker_positions(source: str) -> list[int]:
     return [m.start() + 1 for m in re.finditer(re.escape(MARKER), source)]
 
 
-def instance_end(text: str, start: int) -> int:
+def block_end(text: str, start: int) -> int:
     depth = 0
     saw_open = False
     for i in range(start, len(text)):
@@ -188,8 +202,13 @@ def instance_end(text: str, start: int) -> int:
         elif text[i] == "}":
             depth -= 1
             if saw_open and depth == 0:
-                return i + 1
-    raise ValueError("Unclosed $ instance block")
+                end = i + 1
+                while end < len(text) and text[end].isspace() and text[end] != "\n":
+                    end += 1
+                if end < len(text) and text[end] == ";":
+                    end += 1
+                return end
+    raise ValueError("Unclosed $ block")
 
 
 def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
@@ -202,12 +221,7 @@ def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, lis
         for index, start in enumerate(positions):
             next_start = positions[index + 1] if index + 1 < len(positions) else len(source)
             rest = source[start + MARKER_LEN:].lstrip()
-            if rest.startswith("pass"):
-                end = next_start
-            elif rest.startswith("end"):
-                end = start + MARKER_LEN + len(rest.splitlines()[0])
-            else:
-                end = instance_end(source, start)
+            end = block_end(source, start)
 
             text = source[start + MARKER_LEN:end]
             block = MarkerBlock(file=file, start=start, end=end, text=text)
@@ -219,7 +233,7 @@ def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, lis
 
 def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
     pattern = re.compile(
-        rf'^{pass_def.block_keyword}\s+(?P<{pass_def.name_field}>\w+)\s*{{(?P<__body>.*?)}}\s*$',
+        rf'^{pass_def.block_keyword}\s+(?P<{pass_def.name_field}>\w+)\s*{{(?P<__body>.*?)}}\s*;?\s*$',
         re.DOTALL,
     )
     m = pattern.match(block.text.strip())
@@ -261,7 +275,7 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
 
 
 def render_line(template: str, fields: dict[str, str], counters: dict) -> str:
-    return re.sub(r"<<(.*?)>>", lambda m: render_expr(m.group(1), fields, counters), template)
+    return re.sub(r"\[(.*?)\]", lambda m: render_expr(m.group(1), fields, counters), template)
 
 
 def format_cpp_like(source: str) -> str:
@@ -311,7 +325,7 @@ def render_outputs(pass_def: PassDef, instances: list[dict[str, str]]) -> dict[s
         for key, value in all_vars.items():
             if isinstance(value, list):
                 value = "\n".join(value)
-            out = out.replace(f"<<{key}>>", str(value))
+            out = out.replace(f"[{key}]", str(value))
         outputs[tag] = format_cpp_like(out)
     return outputs
 
@@ -362,7 +376,10 @@ def write_happy_syntax(out_base: Path) -> Path:
 // lines look C++-ish to editors while generated files strip them out.
 #define $pass struct
 #define $tile struct
-#define $end
+#define schema() void schema()
+#define init() void init()
+#define instance() void instance()
+#define target(name) void target_##name()
 
 """)
     print(f"Written happy syntax: {out_path}")
@@ -399,12 +416,10 @@ def main() -> None:
 
     for block in blocks:
         stripped = block.text.lstrip()
-        if stripped.startswith("pass") or stripped.startswith("end"):
+        if stripped.startswith("pass"):
             continue
 
         marker_name = stripped.split(None, 1)[0]
-        if marker_name == "end":
-            continue
         pass_def = pass_defs.get(marker_name)
         if pass_def is None:
             raise ValueError(f"Unknown ${marker_name} block in {block.file}")

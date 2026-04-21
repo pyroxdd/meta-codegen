@@ -5,69 +5,74 @@
 $tile air {
   texture = none;
   durability = 0;
-}
+};
 
 $tile dirt {
   texture = tex_dirt_01;
   durability = 5;
-}
+};
 
 #include <array>
 #include <cstddef>
 
 $pass tile {
-  what
-    tile <<name>> {
-      texture = <<texture>>;
-      durability = <<durability>>;
+  schema() {
+    tile [name] {
+      texture = [texture];
+      durability = [durability];
     }
+  }
 
-  init
+  init() {
     count = 0
     tile_decls = []
     tiles = []
     hits = []
     textures = []
+  }
 
-  instance
-    tile_decls += static const tile <<name>>;
-    tiles += inline constexpr tile tile::<<name>> = {<<count++>>};
-    textures += <<texture>>,
+  instance() {
+    tile_decls += static const tile [name];
+    tiles += inline constexpr tile tile::[name] = {[count++]};
+    textures += [texture],
     hits += 
-      case tile::<<name>>.index: {
-        << "return false;" if durability == "0" else "return true;" >>
+      case tile::[name].index: {
+        [ "return false;" if durability == "0" else "return true;" ]
       } break;
+  }
 
-  out server
+  target(server) {
     struct tile {
       int index;
       bool hit() const;
-      <<tile_decls>>
+      [tile_decls]
     };
 
-    <<tiles>>
+    [tiles]
 
     inline bool tile::hit() const {
       switch(index) {
-        <<hits>>
+        [hits]
         default: return false;
       }
     }
+  }
 
-  out client
+  target(client) {
     struct tile {
       int index;
-      <<tile_decls>>
+      [tile_decls]
     };
 
-    <<tiles>>
+    [tiles]
 
     tile_texture tile_textures[] = {
-      <<textures>>
+      [textures]
     };
-}
+  }
+};
 
-$end
+
 
 namespace tiles {
 constexpr std::size_t width = 4;
