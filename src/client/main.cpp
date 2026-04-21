@@ -5,9 +5,13 @@ enum tile_texture {
     tex_dirt_01,
 };
 
-#include "tile.h"
+#include "shared/tiles.h"
 
 int main() {
-    std::cout << "client: tile::dirt.index = " << tile::dirt.index << "\n";
+    tiles::init_tiles();
+    tiles::set_tile(3, 0, tile::dirt);
+
+    const tile selected = tiles::get_tile(3, 0);
+    std::cout << "client: selected.index = " << selected.index << "\n";
     return 0;
 }

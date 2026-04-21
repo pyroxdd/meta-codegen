@@ -1,29 +1,45 @@
 """
-pass_compiler.py
+aot_transpiler.py
 
-Compiles all .pass files from a directory into Python generators,
-then runs them.
+Scans shared source files for @@ markers, generates target-specific headers,
+and writes cleaned copies of the shared sources into each target build folder.
 
 Usage:
-    python pass_compiler.py <pass_file_or_dir> <gen_py_dir> <out_base_dir> <tag=filename>...
-
-Example:
-    python pass_compiler.py tile.pass build/gen_py out server=server.h client=client.h
+    python aot_transpiler.py <shared_dir> <gen_py_dir> <out_base_dir> <tag=file>...
 """
 
 import re
-import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
-# ---------------------------------------------------------------------------
-# Parsers
-# ---------------------------------------------------------------------------
+MARKER = "\n@@"
 
-def parse_pass_file(source: str) -> dict:
+
+@dataclass
+class MarkerBlock:
+    file: Path
+    start: int
+    end: int
+    text: str
+    replacement: str = ""
+
+
+@dataclass
+class PassDef:
+    name: str
+    block_keyword: str
+    name_field: str
+    fields: dict[str, str]
+    init_vars: dict
+    instance_ops: list[tuple[str, str]]
+    out_sections: dict[str, str]
+
+
+def parse_pass_file(source: str) -> dict[str, str]:
     section_re = re.compile(
-        r'^[ \t]*(pass|where|what|init|instance|out\s+\w+)\b',
+        r'^[ \t]*(pass|what|init|instance|out\s+\w+)\b',
         re.MULTILINE,
     )
 
@@ -45,35 +61,31 @@ def parse_pass_file(source: str) -> dict:
     return sections
 
 
-def parse_out_sections(sections: dict):
+def parse_out_sections(sections: dict[str, str]) -> dict[str, str]:
     outs = {}
     for key, body in sections.items():
         if key.startswith("out:"):
-            tag = key.split(":", 1)[1]
-            template = body.strip()
-            outs[tag] = template
+            outs[key.split(":", 1)[1]] = body.strip()
     return outs
 
 
-def parse_what_template(what_body: str):
+def parse_what_template(what_body: str) -> tuple[str, str, dict[str, str]]:
     lines = what_body.strip().splitlines()
     header = lines[0].strip()
     m = re.match(r'(\w+)\s+<<(\w+)>>\s*\{', header)
     if not m:
         raise ValueError(f"Invalid what header: {header!r}")
-    block_keyword = m.group(1)
-    name_field = m.group(2)
 
     fields = {}
     for line in lines[1:]:
         line = line.strip()
-        if not line or line in ('{', '}'):
+        if not line or line in ("{", "}"):
             continue
         fm = re.match(r'(\w+)\s*=\s*<<(\w+)>>\s*;', line)
         if fm:
             fields[fm.group(1)] = fm.group(2)
 
-    return block_keyword, name_field, fields
+    return m.group(1), m.group(2), fields
 
 
 def parse_init_section(init_body: str) -> dict:
@@ -83,7 +95,7 @@ def parse_init_section(init_body: str) -> dict:
         if not m:
             continue
         var, val = m.group(1), m.group(2).strip()
-        if val == '[]':
+        if val == "[]":
             init_vars[var] = []
         elif val.isdigit():
             init_vars[var] = int(val)
@@ -92,7 +104,7 @@ def parse_init_section(init_body: str) -> dict:
     return init_vars
 
 
-def parse_instance_section(instance_body: str) -> list:
+def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
     lines = instance_body.splitlines()
     ops = []
     i = 0
@@ -120,44 +132,97 @@ def parse_instance_section(instance_body: str) -> list:
     return ops
 
 
-# ---------------------------------------------------------------------------
-# Compiler
-# ---------------------------------------------------------------------------
+def pass_name(pass_text: str, file: Path) -> str:
+    first_line = pass_text.lstrip().splitlines()[0].strip()
+    m = re.match(r"pass\s+(\w+)\s*$", first_line)
+    if not m:
+        raise ValueError(f"Expected @@pass <name> in {file}")
+    return m.group(1)
 
-def compile_pass(source: str, root_dir: str, out_map: dict) -> str:
-    sections = parse_pass_file(source)
 
-    glob_pattern = sections['where'].strip()
-    block_keyword, name_field, fields = parse_what_template(sections['what'])
-    init_vars = parse_init_section(sections['init'])
-    instance_ops = parse_instance_section(sections['instance'])
-    out_sections = parse_out_sections(sections)
+def compile_pass(pass_text: str, file: Path) -> PassDef:
+    name = pass_name(pass_text, file)
+    sections = parse_pass_file(pass_text)
+    missing = [name for name in ("what", "init", "instance") if name not in sections]
+    if missing:
+        raise ValueError(f"@@pass {name} is missing section(s): {', '.join(missing)}")
 
-    L = []
-    def w(x=""): L.append(x)
+    block_keyword, name_field, fields = parse_what_template(sections["what"])
+    if block_keyword != name:
+        raise ValueError(f"@@pass {name} has what block for {block_keyword}")
 
-    w("import re")
-    w("from pathlib import Path")
-    w()
+    return PassDef(
+        name=name,
+        block_keyword=block_keyword,
+        name_field=name_field,
+        fields=fields,
+        init_vars=parse_init_section(sections["init"]),
+        instance_ops=parse_instance_section(sections["instance"]),
+        out_sections=parse_out_sections(sections),
+    )
 
-    w(f"ROOT_DIR = Path({repr(root_dir)})")
-    w(f"GLOB_PATTERN = {repr(glob_pattern)}")
-    w(f"OUT_MAP = {repr(out_map)}")
-    w(f"OUT_TEMPLATES = {repr(out_sections)}")
-    w(f"INIT_VARS = {repr(init_vars)}")
-    w(f"INSTANCE_OPS = {repr(instance_ops)}")
-    w()
 
-    w("INSTANCE_RE = re.compile(")
-    w(f"    r'{block_keyword}\\s+(?P<{name_field}>\\w+)\\s*{{(?P<__body>.*?)}}', re.DOTALL")
-    w(")")
-    w("FIELD_RE = {")
-    for source_field, target_field in fields.items():
-        w(f"    {target_field!r}: re.compile(r'{source_field}\\s*=\\s*(.*?)\\s*;', re.DOTALL),")
-    w("}")
+def marker_positions(source: str) -> list[int]:
+    return [m.start() + 1 for m in re.finditer(re.escape(MARKER), source)]
 
-    w("""
-def render_expr(expr, fields, counters):
+
+def instance_end(text: str, start: int) -> int:
+    depth = 0
+    saw_open = False
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+            saw_open = True
+        elif text[i] == "}":
+            depth -= 1
+            if saw_open and depth == 0:
+                return i + 1
+    raise ValueError("Unclosed @@ instance block")
+
+
+def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
+    blocks = []
+    strip_blocks: dict[Path, list[MarkerBlock]] = {}
+
+    for file in sorted(shared_dir.rglob("*.h")):
+        source = file.read_text()
+        positions = marker_positions(source)
+        for index, start in enumerate(positions):
+            next_start = positions[index + 1] if index + 1 < len(positions) else len(source)
+            rest = source[start + 2:].lstrip()
+            if rest.startswith("pass"):
+                end = next_start
+            elif rest.startswith("end"):
+                end = start + 2 + len(rest.splitlines()[0])
+            else:
+                end = instance_end(source, start)
+
+            text = source[start + 2:end]
+            block = MarkerBlock(file=file, start=start, end=end, text=text)
+            blocks.append(block)
+            strip_blocks.setdefault(file, []).append(block)
+
+    return blocks, strip_blocks
+
+
+def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
+    pattern = re.compile(
+        rf'^{pass_def.block_keyword}\s+(?P<{pass_def.name_field}>\w+)\s*{{(?P<__body>.*?)}}\s*$',
+        re.DOTALL,
+    )
+    m = pattern.match(block.text.strip())
+    if not m:
+        raise ValueError(f"Invalid @@{pass_def.block_keyword} block in {block.file}")
+
+    values = m.groupdict()
+    body = values.pop("__body")
+    for source_field, target_field in pass_def.fields.items():
+        field_match = re.search(rf'{source_field}\s*=\s*(.*?)\s*;', body, re.DOTALL)
+        values[target_field] = field_match.group(1).strip() if field_match else ""
+    return values
+
+
+def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
     expr = expr.strip()
 
     if expr.endswith("++"):
@@ -166,10 +231,10 @@ def render_expr(expr, fields, counters):
         counters[var] = val + 1
         return str(val)
 
-    m = re.match(r'"([^"]*?)"\\s+if\\s+(\\w+)\\s*(==|!=)\\s*"([^"]*?)"\\s+else\\s+"([^"]*?)"', expr)
+    m = re.match(r'"([^"]*?)"\s+if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s+else\s+"([^"]*?)"', expr)
     if m:
         t, f, op, cmp, e = m.groups()
-        cond = (fields.get(f, "") == cmp)
+        cond = fields.get(f, "") == cmp
         if op == "!=":
             cond = not cond
         return t if cond else e
@@ -181,14 +246,13 @@ def render_expr(expr, fields, counters):
         return str(counters[expr])
 
     return ""
-""")
-
-    w("""
-def render_line(t, fields, counters):
-    return re.sub(r"<<(.*?)>>", lambda m: render_expr(m.group(1), fields, counters), t)
 
 
-def format_cpp_like(source):
+def render_line(template: str, fields: dict[str, str], counters: dict) -> str:
+    return re.sub(r"<<(.*?)>>", lambda m: render_expr(m.group(1), fields, counters), template)
+
+
+def format_cpp_like(source: str) -> str:
     lines = []
     indent = 0
 
@@ -205,94 +269,118 @@ def format_cpp_like(source):
         if leading_closes:
             indent = max(indent - leading_closes, 0)
 
-        line_indent = indent
-
-        lines.append("  " * line_indent + line)
+        lines.append("  " * indent + line)
 
         trailing_closes = closes - leading_closes
         indent = max(indent + opens - trailing_closes, 0)
 
-    return "\\n".join(lines).rstrip() + "\\n"
-""")
+    return "\n".join(lines).rstrip() + "\n"
 
-    w("""
-def main():
+
+def render_outputs(pass_def: PassDef, instances: list[dict[str, str]]) -> dict[str, str]:
     import copy
-    state = copy.deepcopy(INIT_VARS)
-    counters = {k:v for k,v in state.items() if isinstance(v,int)}
-    accs = {k:v for k,v in state.items() if isinstance(v,list)}
 
-    for f in ROOT_DIR.glob(GLOB_PATTERN):
-        txt = f.read_text()
-        for m in INSTANCE_RE.finditer(txt):
-            fields = m.groupdict()
-            body = fields.pop("__body")
-            for field_name, field_re in FIELD_RE.items():
-                field_match = field_re.search(body)
-                fields[field_name] = field_match.group(1).strip() if field_match else ""
-            for var, tmpl in INSTANCE_OPS:
-                r = render_line(tmpl, fields, counters)
-                if var in accs:
-                    accs[var].append(r)
-                else:
-                    counters[var] = r
+    state = copy.deepcopy(pass_def.init_vars)
+    counters = {k: v for k, v in state.items() if isinstance(v, int)}
+    accs = {k: v for k, v in state.items() if isinstance(v, list)}
+
+    for fields in instances:
+        for var, tmpl in pass_def.instance_ops:
+            rendered = render_line(tmpl, fields, counters)
+            if var in accs:
+                accs[var].append(rendered)
+            else:
+                counters[var] = rendered
 
     all_vars = {**counters, **accs}
-
-    for tag, tmpl in OUT_TEMPLATES.items():
+    outputs = {}
+    for tag, tmpl in pass_def.out_sections.items():
         out = tmpl
-        for k,v in all_vars.items():
-            if isinstance(v,list):
-                v = "\\n".join(v)
-            out = out.replace(f"<<{k}>>", str(v))
-        out = format_cpp_like(out)
-
-        out_path = Path(OUT_MAP[tag])
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(out)
-        print(f"Written {tag}: {out_path}")
-
-if __name__ == "__main__":
-    main()
-""")
-
-    return "\n".join(L)
+        for key, value in all_vars.items():
+            if isinstance(value, list):
+                value = "\n".join(value)
+            out = out.replace(f"<<{key}>>", str(value))
+        outputs[tag] = format_cpp_like(out)
+    return outputs
 
 
-# ---------------------------------------------------------------------------
-# Entry
-# ---------------------------------------------------------------------------
+def strip_blocks(source: str, blocks: list[MarkerBlock]) -> str:
+    parts = []
+    cursor = 0
+    for block in sorted(blocks, key=lambda item: item.start):
+        parts.append(source[cursor:block.start])
+        parts.append(block.replacement)
+        cursor = block.end
+    parts.append(source[cursor:])
+    source = "".join(parts)
+    source = re.sub(r"\n{3,}", "\n\n", source)
+    return source.strip() + "\n"
 
-def main():
+
+def write_generated_sources(shared_dir: Path, strip_map: dict[Path, list[MarkerBlock]], out_map: dict[str, Path]) -> None:
+    for tag, out_file in out_map.items():
+        output_root = out_file.parent
+        for file in sorted(shared_dir.rglob("*.h")):
+            rel = file.relative_to(shared_dir.parent)
+            out_path = output_root / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(strip_blocks(file.read_text(), strip_map.get(file, [])))
+            print(f"Written {tag}: {out_path}")
+
+
+def main() -> None:
     if len(sys.argv) < 5:
-        print("Usage: pass_compiler.py <pass_file_or_dir> <gen_py_dir> <out_base_dir> tag=file ...")
+        print("Usage: aot_transpiler.py <shared_dir> <gen_py_dir> <out_base_dir> tag=file ...")
         sys.exit(1)
 
-    pass_source = Path(sys.argv[1])
+    shared_dir = Path(sys.argv[1])
     gen_dir = Path(sys.argv[2])
     out_base = Path(sys.argv[3])
-
-    tag_map = {}
-    for arg in sys.argv[4:]:
-        tag, fname = arg.split("=")
-        tag_map[tag] = str(out_base / fname)
+    out_map = {tag: out_base / fname for tag, fname in (arg.split("=", 1) for arg in sys.argv[4:])}
 
     gen_dir.mkdir(parents=True, exist_ok=True)
+    gen_stamp = gen_dir / "content.py"
 
-    root_dir = pass_source.parent if pass_source.is_file() else pass_source
-    pass_files = [pass_source] if pass_source.is_file() else sorted(pass_source.glob("*.pass"))
-    if not pass_files:
-        print(f"No .pass files found in {pass_source}")
-        sys.exit(1)
+    blocks, strip_map = discover_blocks(shared_dir)
+    pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
+    if not pass_blocks:
+        raise ValueError(f"No @@pass block found under {shared_dir}")
 
-    for p in pass_files:
-        compiled = compile_pass(p.read_text(), str(root_dir), tag_map)
+    pass_defs: dict[str, PassDef] = {}
+    for block in pass_blocks:
+        pass_def = compile_pass(block.text, block.file)
+        if pass_def.name in pass_defs:
+            raise ValueError(f"Duplicate @@pass {pass_def.name}")
+        pass_defs[pass_def.name] = pass_def
+        block.replacement = f'#include "{pass_def.name}.h"'
 
-        out_py = gen_dir / (p.stem + ".py")
-        out_py.write_text(compiled)
+    instances_by_pass = {name: [] for name in pass_defs}
 
-        print(f"Running {out_py}", flush=True)
-        subprocess.run([sys.executable, str(out_py)], check=True)
+    for block in blocks:
+        stripped = block.text.lstrip()
+        if stripped.startswith("pass") or stripped.startswith("end"):
+            continue
+
+        marker_name = stripped.split(None, 1)[0]
+        if marker_name == "end":
+            continue
+        pass_def = pass_defs.get(marker_name)
+        if pass_def is None:
+            raise ValueError(f"Unknown @@{marker_name} block in {block.file}")
+        instances_by_pass[marker_name].append(parse_instance(block, pass_def))
+
+    for name, pass_def in pass_defs.items():
+        for tag, content in render_outputs(pass_def, instances_by_pass[name]).items():
+            if tag not in out_map:
+                raise ValueError(f"No output mapping provided for tag {tag!r}")
+            out_path = out_map[tag]
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(content)
+            print(f"Written {tag}: {out_path}")
+
+    write_generated_sources(shared_dir, strip_map, out_map)
+    gen_stamp.write_text("# Generated by aot_transpiler.py\n")
+    print(f"Written generator stamp: {gen_stamp}")
 
 
 if __name__ == "__main__":

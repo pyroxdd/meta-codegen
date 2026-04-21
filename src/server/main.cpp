@@ -1,8 +1,12 @@
 #include <iostream>
 
-#include "tile.h"
+#include "shared/tiles.h"
 
 int main() {
-    std::cout << "server: tile::air.hit() = " << tile::air.hit() << "\n";
+    tiles::init_tiles();
+    tiles::set_tile(1, 2, tile::dirt);
+
+    const tile selected = tiles::get_tile(1, 2);
+    std::cout << "server: selected.hit() = " << selected.hit() << "\n";
     return 0;
 }
