@@ -10,6 +10,7 @@ set(CLIENT_BUILD_DIR "${CMAKE_BINARY_DIR}/client")
 set(TILE_SERVER_HEADER "${SERVER_BUILD_DIR}/tile.h")
 set(TILE_CLIENT_HEADER "${CLIENT_BUILD_DIR}/tile.h")
 set(TILE_GENERATED_PY "${GEN_PY_DIR}/content.py")
+set(HAPPY_SYNTAX_HEADER "${CMAKE_BINARY_DIR}/happy_syntax.h")
 
 file(GLOB TILE_INPUTS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/shared/*.h")
 set(TILE_GENERATED_SHARED_HEADERS)
@@ -26,6 +27,7 @@ add_custom_command(
         "${TILE_GENERATED_PY}"
         "${TILE_SERVER_HEADER}"
         "${TILE_CLIENT_HEADER}"
+        "${HAPPY_SYNTAX_HEADER}"
         ${TILE_GENERATED_SHARED_HEADERS}
     COMMAND
         "${Python3_EXECUTABLE}"
@@ -47,6 +49,7 @@ add_custom_target(generate_content DEPENDS
     "${TILE_GENERATED_PY}"
     "${TILE_SERVER_HEADER}"
     "${TILE_CLIENT_HEADER}"
+    "${HAPPY_SYNTAX_HEADER}"
     ${TILE_GENERATED_SHARED_HEADERS}
 )
 

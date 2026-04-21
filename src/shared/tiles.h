@@ -1,11 +1,13 @@
 #pragma once
 
-@@tile air {
+#include "../../build/happy_syntax.h"
+
+$tile air {
   texture = none;
   durability = 0;
 }
 
-@@tile dirt {
+$tile dirt {
   texture = tex_dirt_01;
   durability = 5;
 }
@@ -13,7 +15,7 @@
 #include <array>
 #include <cstddef>
 
-@@pass tile
+$pass tile {
   what
     tile <<name>> {
       texture = <<texture>>;
@@ -63,8 +65,9 @@
     tile_texture tile_textures[] = {
       <<textures>>
     };
+}
 
-@@end
+$end
 
 namespace tiles {
 constexpr std::size_t width = 4;

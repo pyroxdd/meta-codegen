@@ -1,7 +1,7 @@
 """
 aot_transpiler.py
 
-Scans shared source files for @@ markers, generates target-specific headers,
+Scans shared source files for $ markers, generates target-specific headers,
 and writes cleaned copies of the shared sources into each target build folder.
 
 Usage:
@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-MARKER = "\n@@"
+MARKER = "\n$"
+MARKER_LEN = 1
+HAPPY_SYNTAX_INCLUDE = '#include "../../build/happy_syntax.h"'
 
 
 @dataclass
@@ -134,22 +136,32 @@ def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
 
 def pass_name(pass_text: str, file: Path) -> str:
     first_line = pass_text.lstrip().splitlines()[0].strip()
-    m = re.match(r"pass\s+(\w+)\s*$", first_line)
+    m = re.match(r"pass\s+(\w+)\s*\{?\s*$", first_line)
     if not m:
-        raise ValueError(f"Expected @@pass <name> in {file}")
+        raise ValueError(f"Expected $pass <name> in {file}")
     return m.group(1)
 
 
+def unwrap_pass_block(pass_text: str) -> str:
+    lines = pass_text.strip().splitlines()
+    if lines and lines[0].strip().endswith("{"):
+        lines[0] = lines[0].rstrip().removesuffix("{").rstrip()
+    if lines and lines[-1].strip() == "}":
+        lines.pop()
+    return "\n".join(lines)
+
+
 def compile_pass(pass_text: str, file: Path) -> PassDef:
+    pass_text = unwrap_pass_block(pass_text)
     name = pass_name(pass_text, file)
     sections = parse_pass_file(pass_text)
     missing = [name for name in ("what", "init", "instance") if name not in sections]
     if missing:
-        raise ValueError(f"@@pass {name} is missing section(s): {', '.join(missing)}")
+        raise ValueError(f"$pass {name} is missing section(s): {', '.join(missing)}")
 
     block_keyword, name_field, fields = parse_what_template(sections["what"])
     if block_keyword != name:
-        raise ValueError(f"@@pass {name} has what block for {block_keyword}")
+        raise ValueError(f"$pass {name} has what block for {block_keyword}")
 
     return PassDef(
         name=name,
@@ -177,7 +189,7 @@ def instance_end(text: str, start: int) -> int:
             depth -= 1
             if saw_open and depth == 0:
                 return i + 1
-    raise ValueError("Unclosed @@ instance block")
+    raise ValueError("Unclosed $ instance block")
 
 
 def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
@@ -189,15 +201,15 @@ def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, lis
         positions = marker_positions(source)
         for index, start in enumerate(positions):
             next_start = positions[index + 1] if index + 1 < len(positions) else len(source)
-            rest = source[start + 2:].lstrip()
+            rest = source[start + MARKER_LEN:].lstrip()
             if rest.startswith("pass"):
                 end = next_start
             elif rest.startswith("end"):
-                end = start + 2 + len(rest.splitlines()[0])
+                end = start + MARKER_LEN + len(rest.splitlines()[0])
             else:
                 end = instance_end(source, start)
 
-            text = source[start + 2:end]
+            text = source[start + MARKER_LEN:end]
             block = MarkerBlock(file=file, start=start, end=end, text=text)
             blocks.append(block)
             strip_blocks.setdefault(file, []).append(block)
@@ -212,7 +224,7 @@ def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
     )
     m = pattern.match(block.text.strip())
     if not m:
-        raise ValueError(f"Invalid @@{pass_def.block_keyword} block in {block.file}")
+        raise ValueError(f"Invalid ${pass_def.block_keyword} block in {block.file}")
 
     values = m.groupdict()
     body = values.pop("__body")
@@ -317,6 +329,17 @@ def strip_blocks(source: str, blocks: list[MarkerBlock]) -> str:
     return source.strip() + "\n"
 
 
+def ensure_happy_syntax_include(source: str) -> str:
+    if HAPPY_SYNTAX_INCLUDE in source:
+        return source
+
+    pragma = "#pragma once"
+    if source.startswith(pragma):
+        return source.replace(pragma, f"{pragma}\n\n{HAPPY_SYNTAX_INCLUDE}", 1)
+
+    return f"{HAPPY_SYNTAX_INCLUDE}\n\n{source}"
+
+
 def write_generated_sources(shared_dir: Path, strip_map: dict[Path, list[MarkerBlock]], out_map: dict[str, Path]) -> None:
     for tag, out_file in out_map.items():
         output_root = out_file.parent
@@ -324,8 +347,26 @@ def write_generated_sources(shared_dir: Path, strip_map: dict[Path, list[MarkerB
             rel = file.relative_to(shared_dir.parent)
             out_path = output_root / rel
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(strip_blocks(file.read_text(), strip_map.get(file, [])))
+            out = strip_blocks(file.read_text(), strip_map.get(file, []))
+            out_path.write_text(ensure_happy_syntax_include(out))
             print(f"Written {tag}: {out_path}")
+
+
+def write_happy_syntax(out_base: Path) -> Path:
+    out_path = out_base / "happy_syntax.h"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("""#pragma once
+
+// Editor-only helper for source files that contain $ transpiler markers.
+// GCC and Clang accept '$' in identifiers, so these macros make marker
+// lines look C++-ish to editors while generated files strip them out.
+#define $pass struct
+#define $tile struct
+#define $end
+
+""")
+    print(f"Written happy syntax: {out_path}")
+    return out_path
 
 
 def main() -> None:
@@ -344,13 +385,13 @@ def main() -> None:
     blocks, strip_map = discover_blocks(shared_dir)
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
     if not pass_blocks:
-        raise ValueError(f"No @@pass block found under {shared_dir}")
+        raise ValueError(f"No $pass block found under {shared_dir}")
 
     pass_defs: dict[str, PassDef] = {}
     for block in pass_blocks:
         pass_def = compile_pass(block.text, block.file)
         if pass_def.name in pass_defs:
-            raise ValueError(f"Duplicate @@pass {pass_def.name}")
+            raise ValueError(f"Duplicate $pass {pass_def.name}")
         pass_defs[pass_def.name] = pass_def
         block.replacement = f'#include "{pass_def.name}.h"'
 
@@ -366,7 +407,7 @@ def main() -> None:
             continue
         pass_def = pass_defs.get(marker_name)
         if pass_def is None:
-            raise ValueError(f"Unknown @@{marker_name} block in {block.file}")
+            raise ValueError(f"Unknown ${marker_name} block in {block.file}")
         instances_by_pass[marker_name].append(parse_instance(block, pass_def))
 
     for name, pass_def in pass_defs.items():
@@ -379,6 +420,7 @@ def main() -> None:
             print(f"Written {tag}: {out_path}")
 
     write_generated_sources(shared_dir, strip_map, out_map)
+    write_happy_syntax(out_base)
     gen_stamp.write_text("# Generated by aot_transpiler.py\n")
     print(f"Written generator stamp: {gen_stamp}")
 
