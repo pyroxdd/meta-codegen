@@ -7,10 +7,11 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(GEN_PY_DIR "${CMAKE_BINARY_DIR}/gen_py")
 set(SERVER_BUILD_DIR "${CMAKE_BINARY_DIR}/server")
 set(CLIENT_BUILD_DIR "${CMAKE_BINARY_DIR}/client")
-set(TILE_SERVER_HEADER "${SERVER_BUILD_DIR}/tile.h")
-set(TILE_CLIENT_HEADER "${CLIENT_BUILD_DIR}/tile.h")
+set(SERVER_CONTENT_STAMP "${SERVER_BUILD_DIR}/content.stamp")
+set(CLIENT_CONTENT_STAMP "${CLIENT_BUILD_DIR}/content.stamp")
 set(TILE_GENERATED_PY "${GEN_PY_DIR}/content.py")
 set(HAPPY_SYNTAX_HEADER "${CMAKE_BINARY_DIR}/happy_syntax.h")
+set(CURSOR_HEADERS tile_decls.h tiles.h hits.h textures.h)
 
 file(GLOB TILE_INPUTS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/shared/*.h")
 set(TILE_GENERATED_SHARED_HEADERS)
@@ -21,22 +22,30 @@ foreach(TILE_INPUT IN LISTS TILE_INPUTS)
         "${CLIENT_BUILD_DIR}/${TILE_INPUT_REL}"
     )
 endforeach()
+set(TILE_GENERATED_CURSOR_HEADERS)
+foreach(CURSOR_HEADER IN LISTS CURSOR_HEADERS)
+    list(APPEND TILE_GENERATED_CURSOR_HEADERS
+        "${SERVER_BUILD_DIR}/${CURSOR_HEADER}"
+        "${CLIENT_BUILD_DIR}/${CURSOR_HEADER}"
+    )
+endforeach()
 
 add_custom_command(
     OUTPUT
         "${TILE_GENERATED_PY}"
-        "${TILE_SERVER_HEADER}"
-        "${TILE_CLIENT_HEADER}"
+        "${SERVER_CONTENT_STAMP}"
+        "${CLIENT_CONTENT_STAMP}"
         "${HAPPY_SYNTAX_HEADER}"
         ${TILE_GENERATED_SHARED_HEADERS}
+        ${TILE_GENERATED_CURSOR_HEADERS}
     COMMAND
         "${Python3_EXECUTABLE}"
         "${CMAKE_SOURCE_DIR}/aot_transpiler.py"
         "${CMAKE_SOURCE_DIR}/src/shared"
         "${GEN_PY_DIR}"
         "${CMAKE_BINARY_DIR}"
-        server=server/tile.h
-        client=client/tile.h
+        server=server/content.stamp
+        client=client/content.stamp
     DEPENDS
         "${CMAKE_SOURCE_DIR}/aot_transpiler.py"
         ${TILE_INPUTS}
@@ -47,10 +56,11 @@ add_custom_command(
 
 add_custom_target(generate_content DEPENDS
     "${TILE_GENERATED_PY}"
-    "${TILE_SERVER_HEADER}"
-    "${TILE_CLIENT_HEADER}"
+    "${SERVER_CONTENT_STAMP}"
+    "${CLIENT_CONTENT_STAMP}"
     "${HAPPY_SYNTAX_HEADER}"
     ${TILE_GENERATED_SHARED_HEADERS}
+    ${TILE_GENERATED_CURSOR_HEADERS}
 )
 
 add_executable(server "src/server/main.cpp")
@@ -60,6 +70,7 @@ set_target_properties(server PROPERTIES
 )
 target_include_directories(server PRIVATE
     "${SERVER_BUILD_DIR}"
+    "${CMAKE_SOURCE_DIR}/src/server"
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
@@ -71,6 +82,7 @@ set_target_properties(client PROPERTIES
 )
 target_include_directories(client PRIVATE
     "${CLIENT_BUILD_DIR}"
+    "${CMAKE_SOURCE_DIR}/src/client"
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )

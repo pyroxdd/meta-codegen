@@ -40,36 +40,6 @@ $pass tile {
         [ "return false;" if durability == "0" else "return true;" ]
       } break;
   }
-
-  target(server) {
-    struct tile {
-      int index;
-      bool hit() const;
-      [tile_decls]
-    };
-
-    [tiles]
-
-    inline bool tile::hit() const {
-      switch(index) {
-        [hits]
-        default: return false;
-      }
-    }
-  }
-
-  target(client) {
-    struct tile {
-      int index;
-      [tile_decls]
-    };
-
-    [tiles]
-
-    tile_texture tile_textures[] = {
-      [textures]
-    };
-  }
 };
 
 
