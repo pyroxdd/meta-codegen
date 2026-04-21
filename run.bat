@@ -1,2 +1,3 @@
 @echo off
-out\main.exe
+build\server\server.exe
+build\client\client.exe

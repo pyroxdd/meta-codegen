@@ -1,6 +1,6 @@
 pass
   where
-    src/tiles/*.h
+    src/shared/*.h
 
   what
     tile <<name>> {

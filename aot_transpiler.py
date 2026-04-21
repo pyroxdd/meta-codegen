@@ -5,10 +5,10 @@ Compiles all .pass files from a directory into Python generators,
 then runs them.
 
 Usage:
-    python pass_compiler.py <pass_dir> <gen_py_dir> <out_base_dir> <tag=filename>...
+    python pass_compiler.py <pass_file_or_dir> <gen_py_dir> <out_base_dir> <tag=filename>...
 
 Example:
-    python pass_compiler.py passes gen_py out server=server.h client=client.h
+    python pass_compiler.py tile.pass build/gen_py out server=server.h client=client.h
 """
 
 import re
@@ -124,7 +124,7 @@ def parse_instance_section(instance_body: str) -> list:
 # Compiler
 # ---------------------------------------------------------------------------
 
-def compile_pass(source: str, pass_dir: str, out_map: dict) -> str:
+def compile_pass(source: str, root_dir: str, out_map: dict) -> str:
     sections = parse_pass_file(source)
 
     glob_pattern = sections['where'].strip()
@@ -140,7 +140,7 @@ def compile_pass(source: str, pass_dir: str, out_map: dict) -> str:
     w("from pathlib import Path")
     w()
 
-    w(f"PASS_DIR = Path({repr(pass_dir)})")
+    w(f"ROOT_DIR = Path({repr(root_dir)})")
     w(f"GLOB_PATTERN = {repr(glob_pattern)}")
     w(f"OUT_MAP = {repr(out_map)}")
     w(f"OUT_TEMPLATES = {repr(out_sections)}")
@@ -222,7 +222,7 @@ def main():
     counters = {k:v for k,v in state.items() if isinstance(v,int)}
     accs = {k:v for k,v in state.items() if isinstance(v,list)}
 
-    for f in PASS_DIR.glob(GLOB_PATTERN):
+    for f in ROOT_DIR.glob(GLOB_PATTERN):
         txt = f.read_text()
         for m in INSTANCE_RE.finditer(txt):
             fields = m.groupdict()
@@ -265,10 +265,10 @@ if __name__ == "__main__":
 
 def main():
     if len(sys.argv) < 5:
-        print("Usage: pass_compiler.py <pass_dir> <gen_py_dir> <out_base_dir> tag=file ...")
+        print("Usage: pass_compiler.py <pass_file_or_dir> <gen_py_dir> <out_base_dir> tag=file ...")
         sys.exit(1)
 
-    pass_dir = Path(sys.argv[1])
+    pass_source = Path(sys.argv[1])
     gen_dir = Path(sys.argv[2])
     out_base = Path(sys.argv[3])
 
@@ -279,13 +279,14 @@ def main():
 
     gen_dir.mkdir(parents=True, exist_ok=True)
 
-    pass_files = sorted(pass_dir.glob("*.pass"))
+    root_dir = pass_source.parent if pass_source.is_file() else pass_source
+    pass_files = [pass_source] if pass_source.is_file() else sorted(pass_source.glob("*.pass"))
     if not pass_files:
-        print(f"No .pass files found in {pass_dir}")
+        print(f"No .pass files found in {pass_source}")
         sys.exit(1)
 
     for p in pass_files:
-        compiled = compile_pass(p.read_text(), str(pass_dir), tag_map)
+        compiled = compile_pass(p.read_text(), str(root_dir), tag_map)
 
         out_py = gen_dir / (p.stem + ".py")
         out_py.write_text(compiled)
