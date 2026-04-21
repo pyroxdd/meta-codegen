@@ -16,19 +16,17 @@ $tile dirt {
 #include <cstddef>
 
 $pass tile {
+  count = 0
+  tile_decls = []
+  tiles = []
+  hits = []
+  textures = []
+
   schema() {
     tile [name] {
       texture = [texture];
       durability = [durability];
     }
-  }
-
-  init() {
-    count = 0
-    tile_decls = []
-    tiles = []
-    hits = []
-    textures = []
   }
 
   instance() {

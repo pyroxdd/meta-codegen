@@ -10,6 +10,7 @@ Usage:
 
 import re
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,13 +47,24 @@ def parse_pass_file(source: str) -> dict[str, str]:
 
     positions = [(m.group(0).strip(), m.start()) for m in section_re.finditer(source)]
     sections: dict[str, str] = {}
+    first_section_start = positions[0][1] if positions else len(source)
+    raw_init = source[:first_section_start].strip()
+    if raw_init:
+        sections["python"] = raw_init
 
     for i, (name, start) in enumerate(positions):
         end = positions[i + 1][1] if i + 1 < len(positions) else len(source)
         body = source[start:end]
 
         key = re.match(r'\w+', name).group(0)
-        body = re.sub(r'^[ \t]*' + re.escape(name) + r'[ \t]*(?:\{\s*)?\n?', '', body, count=1)
+        if key == "pass":
+            body = re.sub(r'^[ \t]*pass\s+\w+[ \t]*(?:\{[ \t]*\n?)?', '', body, count=1)
+            raw_init = textwrap.dedent(body).strip()
+            if raw_init:
+                sections["python"] = raw_init
+            continue
+
+        body = re.sub(r'^[ \t]*' + re.escape(name) + r'[ \t]*(?:\{[ \t]*\n?)?', '', body, count=1)
         sections[key] = unwrap_section_body(body)
 
     return sections
@@ -90,20 +102,14 @@ def parse_what_template(what_body: str) -> tuple[str, str, dict[str, str]]:
     return m.group(1), m.group(2), fields
 
 
-def parse_init_section(init_body: str) -> dict:
-    init_vars = {}
-    for line in init_body.strip().splitlines():
-        m = re.match(r'(\w+)\s*=\s*(.*)', line.strip())
-        if not m:
-            continue
-        var, val = m.group(1), m.group(2).strip()
-        if val == "[]":
-            init_vars[var] = []
-        elif val.isdigit():
-            init_vars[var] = int(val)
-        else:
-            init_vars[var] = val
-    return init_vars
+def run_init_python(source: str, file: Path) -> dict:
+    source = textwrap.dedent(source).strip()
+    scope = {"__builtins__": {}}
+    try:
+        exec(source, scope, scope)
+    except Exception as exc:
+        raise ValueError(f"Invalid raw python in $pass block in {file}: {exc}") from exc
+    return {key: value for key, value in scope.items() if not key.startswith("__")}
 
 
 def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
@@ -155,7 +161,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     pass_text = unwrap_pass_block(pass_text)
     name = pass_name(pass_text, file)
     sections = parse_pass_file(pass_text)
-    missing = [name for name in ("schema", "init", "instance") if name not in sections]
+    missing = [name for name in ("schema", "instance") if name not in sections]
     if missing:
         raise ValueError(f"$pass {name} is missing section(s): {', '.join(missing)}")
 
@@ -168,7 +174,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         block_keyword=block_keyword,
         name_field=name_field,
         fields=fields,
-        init_vars=parse_init_section(sections["init"]),
+        init_vars=run_init_python(sections.get("python", ""), file),
         instance_ops=parse_instance_section(sections["instance"]),
     )
 
@@ -356,7 +362,6 @@ def write_happy_syntax(out_base: Path) -> Path:
 #define $pass struct
 #define $tile struct
 #define schema() void schema()
-#define init() void init()
 #define instance() void instance()
 
 """)
