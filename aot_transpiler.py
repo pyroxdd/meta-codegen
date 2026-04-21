@@ -59,6 +59,8 @@ def parse_what_template(what_body: str):
     lines = what_body.strip().splitlines()
     header = lines[0].strip()
     m = re.match(r'(\w+)\s+<<(\w+)>>\s*\{', header)
+    if not m:
+        raise ValueError(f"Invalid what header: {header!r}")
     block_keyword = m.group(1)
     name_field = m.group(2)
 
@@ -67,7 +69,7 @@ def parse_what_template(what_body: str):
         line = line.strip()
         if not line or line in ('{', '}'):
             continue
-        fm = re.match(r'(\w+)\s*=\s*<<(\\w+)>>\s*;', line)
+        fm = re.match(r'(\w+)\s*=\s*<<(\w+)>>\s*;', line)
         if fm:
             fields[fm.group(1)] = fm.group(2)
 
@@ -147,8 +149,12 @@ def compile_pass(source: str, pass_dir: str, out_map: dict) -> str:
     w()
 
     w("INSTANCE_RE = re.compile(")
-    w(f"    r'{block_keyword}\\s+(?P<{name_field}>\\w+)\\s*{{(.*?)}}', re.DOTALL)")
+    w(f"    r'{block_keyword}\\s+(?P<{name_field}>\\w+)\\s*{{(?P<__body>.*?)}}', re.DOTALL")
     w(")")
+    w("FIELD_RE = {")
+    for source_field, target_field in fields.items():
+        w(f"    {target_field!r}: re.compile(r'{source_field}\\s*=\\s*(.*?)\\s*;', re.DOTALL),")
+    w("}")
 
     w("""
 def render_expr(expr, fields, counters):
@@ -193,6 +199,10 @@ def main():
         txt = f.read_text()
         for m in INSTANCE_RE.finditer(txt):
             fields = m.groupdict()
+            body = fields.pop("__body")
+            for field_name, field_re in FIELD_RE.items():
+                field_match = field_re.search(body)
+                fields[field_name] = field_match.group(1).strip() if field_match else ""
             for var, tmpl in INSTANCE_OPS:
                 r = render_line(tmpl, fields, counters)
                 if var in accs:
@@ -241,14 +251,19 @@ def main():
 
     gen_dir.mkdir(parents=True, exist_ok=True)
 
-    for p in pass_dir.glob("*.pass"):
+    pass_files = sorted(pass_dir.glob("*.pass"))
+    if not pass_files:
+        print(f"No .pass files found in {pass_dir}")
+        sys.exit(1)
+
+    for p in pass_files:
         compiled = compile_pass(p.read_text(), str(pass_dir), tag_map)
 
         out_py = gen_dir / (p.stem + ".py")
         out_py.write_text(compiled)
 
-        print(f"Running {out_py}")
-        subprocess.run([sys.executable, str(out_py)])
+        print(f"Running {out_py}", flush=True)
+        subprocess.run([sys.executable, str(out_py)], check=True)
 
 
 if __name__ == "__main__":

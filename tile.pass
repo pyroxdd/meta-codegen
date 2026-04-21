@@ -12,9 +12,11 @@ pass
     count = 0
     enum = []
     hits = []
+    textures = []
 
   instance
     enum += <<name>> = <<count++>>,
+    textures += <<texture>>,
     hits += 
       case <<name>>: {
         << "return false;" if durability == "0" else "return true;" >>
@@ -30,4 +32,9 @@ pass
         <<hits>>
         default: return false;
       }
+    }
+
+  out client
+    tile_texture tile_textures[] = {
+      <<textures>>
     }
