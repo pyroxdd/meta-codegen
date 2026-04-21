@@ -287,23 +287,28 @@ def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
 def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
     expr = expr.strip()
 
+    if expr.startswith("{"):
+        end = matching_brace(expr, 0)
+        if end == len(expr) - 1:
+            return render_block(expr[1:end], fields, counters)
+        return ""
+
     if expr.endswith("++"):
         var = expr[:-2].strip()
         val = counters.get(var, 0)
         counters[var] = val + 1
         return str(val)
 
-    m = re.match(r'(.+?)\s+if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s+else\s+(.+)', expr)
-    if m:
-        t, f, op, cmp, e = m.groups()
-        cond = fields.get(f, "") == cmp
-        if op == "!=":
-            cond = not cond
-        return render_expr(t if cond else e, fields, counters)
+    concat = render_implicit_concat(expr, fields, counters)
+    if concat is not None:
+        return concat
 
     parts = split_top_level(expr, "+")
     if len(parts) > 1:
-        return "".join(render_value(part, fields, counters) for part in parts)
+        values = [render_concat_atom(part, fields, counters) for part in parts]
+        if any(value is None for value in values):
+            return ""
+        return "".join(values)
 
     if expr in fields:
         return fields[expr]
@@ -312,6 +317,221 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
         return str(counters[expr])
 
     return render_value(expr, fields, counters)
+
+
+def render_block(body: str, fields: dict[str, str], counters: dict) -> str:
+    body = body.strip()
+    condition = parse_prefix_condition(body)
+    if condition is not None:
+        f, op, cmp, true_body, false_body = condition
+        cond = fields.get(f, "") == cmp
+        if op == "!=":
+            cond = not cond
+        return render_block(true_body if cond else false_body, fields, counters)
+
+    if not body.startswith("return"):
+        raise ValueError(f"Expected return statement in expression block: {body!r}")
+
+    expr = body[6:].strip()
+    if expr.endswith(";"):
+        expr = expr[:-1].strip()
+    ternary = parse_ternary(expr)
+    if ternary is not None:
+        f, op, cmp, true_expr, false_expr = ternary
+        cond = fields.get(f, "") == cmp
+        if op == "!=":
+            cond = not cond
+        return render_expr(true_expr if cond else false_expr, fields, counters)
+    return render_expr(expr, fields, counters)
+
+
+def parse_ternary(expr: str) -> tuple[str, str, str, str, str] | None:
+    m = re.match(r'(\w+)\s*(==|!=)\s*"([^"]*?)"\s*\?', expr)
+    if not m:
+        return None
+
+    true_start = m.end()
+    colon = find_top_level(expr, ":", true_start)
+    if colon is None:
+        return None
+
+    return (
+        m.group(1),
+        m.group(2),
+        m.group(3),
+        expr[true_start:colon].strip(),
+        expr[colon + 1:].strip(),
+    )
+
+
+def parse_prefix_condition(expr: str) -> tuple[str, str, str, str, str] | None:
+    m = re.match(r'if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s*\{', expr)
+    if not m:
+        return None
+
+    true_start = m.end()
+    true_end = matching_brace(expr, true_start - 1)
+    if true_end is None:
+        return None
+
+    rest = expr[true_end + 1:].lstrip()
+    if not rest.startswith("else"):
+        return None
+    rest = rest[4:].lstrip()
+    if not rest.startswith("{"):
+        return None
+
+    false_start_in_rest = 1
+    false_end_in_rest = matching_brace(rest, 0)
+    if false_end_in_rest is None:
+        return None
+
+    if rest[false_end_in_rest + 1:].strip():
+        return None
+
+    return (
+        m.group(1),
+        m.group(2),
+        m.group(3),
+        expr[true_start:true_end].strip(),
+        rest[false_start_in_rest:false_end_in_rest].strip(),
+    )
+
+
+def matching_brace(expr: str, open_index: int) -> int | None:
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for i in range(open_index, len(expr)):
+        ch = expr[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+
+    return None
+
+
+def find_top_level(expr: str, needle: str, start: int = 0) -> int | None:
+    brace_depth = 0
+    paren_depth = 0
+    in_string = False
+    escaped = False
+
+    for i in range(start, len(expr)):
+        ch = expr[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            brace_depth -= 1
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+        elif ch == needle and brace_depth == 0 and paren_depth == 0:
+            return i
+
+    return None
+
+
+def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict) -> str | None:
+    pieces = []
+    i = 0
+    saw_token = False
+
+    while i < len(expr):
+        if expr[i].isspace():
+            i += 1
+            continue
+
+        if expr[i] == '"':
+            i += 1
+            escaped = False
+            value = []
+            while i < len(expr):
+                ch = expr[i]
+                if escaped:
+                    value.append("\\" + ch)
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    break
+                else:
+                    value.append(ch)
+                i += 1
+            if i >= len(expr) or expr[i] != '"':
+                return None
+            pieces.append("".join(value))
+            i += 1
+            saw_token = True
+            continue
+
+        m = re.match(r'[A-Za-z_]\w*(?:\+\+)?', expr[i:])
+        if not m:
+            return None
+
+        token = m.group(0)
+        if i + len(token) + 1 < len(expr) and expr[i + len(token):i + len(token) + 2] == "++":
+            token += "++"
+        if token.endswith("++"):
+            pieces.append(render_expr(token, fields, counters))
+        else:
+            value = render_variable(token, fields, counters)
+            if value is None:
+                return None
+            pieces.append(value)
+        i += len(token)
+        saw_token = True
+
+    if not saw_token or len(pieces) < 2:
+        return None
+
+    return "".join(pieces)
+
+
+def render_variable(token: str, fields: dict[str, str], counters: dict) -> str | None:
+    if token in {"if", "else", "return"}:
+        return None
+    if token in fields:
+        return fields[token]
+    if token in counters:
+        return str(counters[token])
+    return None
+
+
+def render_concat_atom(expr: str, fields: dict[str, str], counters: dict) -> str | None:
+    expr = expr.strip()
+    if expr.endswith("++"):
+        return render_expr(expr, fields, counters)
+    if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
+        return render_value(expr, fields, counters)
+    return render_variable(expr, fields, counters)
 
 
 def split_top_level(expr: str, separator: str) -> list[str]:
@@ -343,6 +563,13 @@ def split_top_level(expr: str, separator: str) -> list[str]:
 
 def render_line(template: str, fields: dict[str, str], counters: dict) -> str:
     return re.sub(r"\[(.*?)\]", lambda m: render_expr(m.group(1), fields, counters), template)
+
+
+def render_template(template: str, fields: dict[str, str], counters: dict) -> str:
+    rendered = render_expr(template, fields, counters)
+    if rendered:
+        return rendered
+    raise ValueError(f"Invalid instance expression: {template!r}")
 
 
 def format_cpp_like(source: str) -> str:
@@ -379,7 +606,7 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]]) -> dict
 
     for fields in instances:
         for var, tmpl in pass_def.instance_ops:
-            rendered = render_line(tmpl, fields, counters)
+            rendered = render_template(tmpl, fields, counters)
             if var in accs:
                 accs[var].append(rendered)
             else:

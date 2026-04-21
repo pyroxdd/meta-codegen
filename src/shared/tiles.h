@@ -35,13 +35,12 @@ $pass tile {
   }
 
   instance() {
-    tile_decls += static const tile [name];
-    tiles += inline constexpr tile tile::[name] = {[count++]};
-    textures += [texture],
-    hits += 
-      case tile::[name].index: {
-        [ "return false;" if durability == "0" else onhit + "return power >= " + durability + ";" ]
-      } break;
+    tile_decls += "static const tile "name";"
+    tiles += "inline constexpr tile tile::"name" = {"count++"};"
+    textures += texture","
+    hits += "case tile::"name".index: {"
+    hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
+    hits += "} break;"
   }
 };
 
