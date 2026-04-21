@@ -5,6 +5,7 @@ enum tile_texture {
     tex_dirt_01,
 };
 
+#include "shared/items.h"
 #include "shared/tiles.h"
 
 int main() {
@@ -13,5 +14,6 @@ int main() {
 
     const tile selected = tiles::get_tile(3, 0);
     std::cout << "client: selected.index = " << selected.index << "\n";
+    std::cout << "client: starter item weight = " << item_weight(items::starter()) << "\n";
     return 0;
 }

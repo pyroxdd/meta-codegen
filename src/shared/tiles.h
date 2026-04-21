@@ -27,11 +27,11 @@ $pass tile {
   textures = []
 
   schema() {
-    tile [name] {
-      texture = [texture];
-      durability = [durability];
-      onhit = [onhit];
-    }
+    "tile "name" {"
+    "texture = "texture";"
+    "durability = "durability";"
+    "onhit = "onhit";"
+    "}"
   }
 
   instance() {

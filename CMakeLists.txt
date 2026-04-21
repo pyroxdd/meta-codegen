@@ -11,7 +11,15 @@ set(SERVER_CONTENT_STAMP "${SERVER_BUILD_DIR}/content.stamp")
 set(CLIENT_CONTENT_STAMP "${CLIENT_BUILD_DIR}/content.stamp")
 set(TILE_GENERATED_PY "${GEN_PY_DIR}/content.py")
 set(HAPPY_SYNTAX_HEADER "${CMAKE_BINARY_DIR}/happy_syntax.h")
-set(CURSOR_HEADERS tile_decls.h tiles.h hits.h textures.h)
+set(CURSOR_HEADERS
+    tile_decls.h
+    tiles.h
+    hits.h
+    textures.h
+    item_decls.h
+    items.h
+    item_weights.h
+)
 
 file(GLOB TILE_INPUTS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/shared/*.h")
 set(TILE_GENERATED_SHARED_HEADERS)
@@ -39,6 +47,8 @@ add_custom_command(
         ${TILE_GENERATED_SHARED_HEADERS}
         ${TILE_GENERATED_CURSOR_HEADERS}
     COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "PYTHONPYCACHEPREFIX=${CMAKE_BINARY_DIR}/pycache"
         "${Python3_EXECUTABLE}"
         "${CMAKE_SOURCE_DIR}/aot_transpiler.py"
         "${CMAKE_SOURCE_DIR}/src/shared"
