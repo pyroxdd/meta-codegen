@@ -1,1 +1,2 @@
+@echo off
 python aot_transpiler.py . build/gen_py out server=server.h client=client.h
