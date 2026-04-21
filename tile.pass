@@ -10,31 +10,44 @@ pass
 
   init
     count = 0
-    enum = []
+    tile_decls = []
+    tiles = []
     hits = []
     textures = []
 
   instance
-    enum += <<name>> = <<count++>>,
+    tile_decls += static const tile <<name>>;
+    tiles += inline constexpr tile tile::<<name>> = {<<count++>>};
     textures += <<texture>>,
     hits += 
-      case <<name>>: {
+      case tile::<<name>>.index: {
         << "return false;" if durability == "0" else "return true;" >>
       } break;
 
   out server
-    enum tile {
-      <<enum>>
-    }
+    struct tile {
+      int index;
+      bool hit() const;
+      <<tile_decls>>
+    };
 
-    bool hit_tile(tile t) {
-      switch(t) {
+    <<tiles>>
+
+    inline bool tile::hit() const {
+      switch(index) {
         <<hits>>
         default: return false;
       }
     }
 
   out client
+    struct tile {
+      int index;
+      <<tile_decls>>
+    };
+
+    <<tiles>>
+
     tile_texture tile_textures[] = {
       <<textures>>
-    }
+    };

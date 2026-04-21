@@ -186,6 +186,33 @@ def render_expr(expr, fields, counters):
     w("""
 def render_line(t, fields, counters):
     return re.sub(r"<<(.*?)>>", lambda m: render_expr(m.group(1), fields, counters), t)
+
+
+def format_cpp_like(source):
+    lines = []
+    indent = 0
+
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+
+        closes = line.count("}")
+        opens = line.count("{")
+        leading_closes = len(re.match(r"^}*", line).group(0))
+        if leading_closes:
+            indent = max(indent - leading_closes, 0)
+
+        line_indent = indent
+
+        lines.append("  " * line_indent + line)
+
+        trailing_closes = closes - leading_closes
+        indent = max(indent + opens - trailing_closes, 0)
+
+    return "\\n".join(lines).rstrip() + "\\n"
 """)
 
     w("""
@@ -218,6 +245,7 @@ def main():
             if isinstance(v,list):
                 v = "\\n".join(v)
             out = out.replace(f"<<{k}>>", str(v))
+        out = format_cpp_like(out)
 
         out_path = Path(OUT_MAP[tag])
         out_path.parent.mkdir(parents=True, exist_ok=True)
