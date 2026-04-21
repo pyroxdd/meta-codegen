@@ -10,10 +10,14 @@ $tile air {
 $tile dirt {
   texture = tex_dirt_01;
   durability = 5;
+  onhit = {
+    std::cout << "dirt hit\n";
+  };
 };
 
 #include <array>
 #include <cstddef>
+#include <iostream>
 
 $pass tile {
   count = 0
@@ -26,6 +30,7 @@ $pass tile {
     tile [name] {
       texture = [texture];
       durability = [durability];
+      onhit = [onhit];
     }
   }
 
@@ -35,7 +40,7 @@ $pass tile {
     textures += [texture],
     hits += 
       case tile::[name].index: {
-        [ "return false;" if durability == "0" else "return true;" ]
+        [ "return false;" if durability == "0" else onhit + "return power >= " + durability + ";" ]
       } break;
   }
 };

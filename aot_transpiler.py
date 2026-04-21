@@ -102,6 +102,41 @@ def parse_what_template(what_body: str) -> tuple[str, str, dict[str, str]]:
     return m.group(1), m.group(2), fields
 
 
+def find_assignment_value(body: str, name: str) -> str:
+    m = re.search(rf'\b{re.escape(name)}\b\s*=', body)
+    if not m:
+        return ""
+
+    start = m.end()
+    depth = 0
+    for i in range(start, len(body)):
+        ch = body[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(depth - 1, 0)
+        elif ch == ";" and depth == 0:
+            return normalize_assignment_value(body[start:i].strip())
+
+    raise ValueError(f"Unterminated assignment for {name}")
+
+
+def normalize_assignment_value(value: str) -> str:
+    if not value.startswith("{") or not value.endswith("}"):
+        return value
+
+    depth = 0
+    for i, ch in enumerate(value):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and i != len(value) - 1:
+                return value
+
+    return textwrap.dedent(value[1:-1]).strip() + "\n"
+
+
 def run_init_python(source: str, file: Path) -> dict:
     source = textwrap.dedent(source).strip()
     scope = {"__builtins__": {}}
@@ -234,9 +269,19 @@ def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
     values = m.groupdict()
     body = values.pop("__body")
     for source_field, target_field in pass_def.fields.items():
-        field_match = re.search(rf'{source_field}\s*=\s*(.*?)\s*;', body, re.DOTALL)
-        values[target_field] = field_match.group(1).strip() if field_match else ""
+        values[target_field] = find_assignment_value(body, source_field)
     return values
+
+
+def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
+    expr = expr.strip()
+    if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
+        return expr[1:-1]
+    if expr in fields:
+        return fields[expr]
+    if expr in counters:
+        return str(counters[expr])
+    return ""
 
 
 def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
@@ -248,13 +293,17 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
         counters[var] = val + 1
         return str(val)
 
-    m = re.match(r'"([^"]*?)"\s+if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s+else\s+"([^"]*?)"', expr)
+    m = re.match(r'(.+?)\s+if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s+else\s+(.+)', expr)
     if m:
         t, f, op, cmp, e = m.groups()
         cond = fields.get(f, "") == cmp
         if op == "!=":
             cond = not cond
-        return t if cond else e
+        return render_expr(t if cond else e, fields, counters)
+
+    parts = split_top_level(expr, "+")
+    if len(parts) > 1:
+        return "".join(render_value(part, fields, counters) for part in parts)
 
     if expr in fields:
         return fields[expr]
@@ -262,7 +311,34 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
     if expr in counters:
         return str(counters[expr])
 
-    return ""
+    return render_value(expr, fields, counters)
+
+
+def split_top_level(expr: str, separator: str) -> list[str]:
+    parts = []
+    start = 0
+    in_string = False
+    escape = False
+
+    for i, ch in enumerate(expr):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if not in_string and ch == separator:
+            parts.append(expr[start:i].strip())
+            start = i + 1
+
+    if not parts:
+        return [expr]
+
+    parts.append(expr[start:].strip())
+    return parts
 
 
 def render_line(template: str, fields: dict[str, str], counters: dict) -> str:
