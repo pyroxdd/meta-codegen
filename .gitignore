@@ -1,5 +1,6 @@
 build/
 local/
 out/
+.vscode/
 __pycache__/
 **/__pycache__/
