@@ -10,7 +10,12 @@ set(CLIENT_BUILD_DIR "${CMAKE_BINARY_DIR}/client")
 set(SERVER_CONTENT_STAMP "${SERVER_BUILD_DIR}/content.stamp")
 set(CLIENT_CONTENT_STAMP "${CLIENT_BUILD_DIR}/content.stamp")
 set(TILE_GENERATED_PY "${GEN_PY_DIR}/content.py")
-set(HAPPY_SYNTAX_HEADER "${CMAKE_BINARY_DIR}/happy_syntax.h")
+set(SYNTAX_HINTS_HEADER "${CMAKE_BINARY_DIR}/syntax_hints.h")
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/out")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "${PROJECT_SOURCE_DIR}/out")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG "${PROJECT_SOURCE_DIR}/out")
+
 set(CURSOR_HEADERS
     tile_decls.h
     tiles.h
@@ -43,23 +48,23 @@ add_custom_command(
         "${TILE_GENERATED_PY}"
         "${SERVER_CONTENT_STAMP}"
         "${CLIENT_CONTENT_STAMP}"
-        "${HAPPY_SYNTAX_HEADER}"
+        "${SYNTAX_HINTS_HEADER}"
         ${TILE_GENERATED_SHARED_HEADERS}
         ${TILE_GENERATED_CURSOR_HEADERS}
     COMMAND
         "${CMAKE_COMMAND}" -E env
         "PYTHONPYCACHEPREFIX=${CMAKE_BINARY_DIR}/pycache"
         "${Python3_EXECUTABLE}"
-        "${CMAKE_SOURCE_DIR}/aot_transpiler.py"
-        "${CMAKE_SOURCE_DIR}/src/shared"
+        "${PROJECT_SOURCE_DIR}/../../metacodegen.py"
+        "${PROJECT_SOURCE_DIR}/src/shared"
         "${GEN_PY_DIR}"
-        "${CMAKE_BINARY_DIR}"
+        "${PROJECT_BINARY_DIR}"
         server=server/content.stamp
         client=client/content.stamp
     DEPENDS
-        "${CMAKE_SOURCE_DIR}/aot_transpiler.py"
+        "${PROJECT_SOURCE_DIR}/../../metacodegen.py"
         ${TILE_INPUTS}
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
     COMMENT "Generating tile content"
     VERBATIM
 )
@@ -68,16 +73,13 @@ add_custom_target(generate_content DEPENDS
     "${TILE_GENERATED_PY}"
     "${SERVER_CONTENT_STAMP}"
     "${CLIENT_CONTENT_STAMP}"
-    "${HAPPY_SYNTAX_HEADER}"
+    "${SYNTAX_HINTS_HEADER}"
     ${TILE_GENERATED_SHARED_HEADERS}
     ${TILE_GENERATED_CURSOR_HEADERS}
 )
 
 add_executable(server "src/server/main.cpp")
 add_dependencies(server generate_content)
-set_target_properties(server PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${SERVER_BUILD_DIR}"
-)
 target_include_directories(server PRIVATE
     "${SERVER_BUILD_DIR}"
     "${CMAKE_SOURCE_DIR}/src/server"
@@ -87,9 +89,6 @@ target_include_directories(server PRIVATE
 
 add_executable(client "src/client/main.cpp")
 add_dependencies(client generate_content)
-set_target_properties(client PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CLIENT_BUILD_DIR}"
-)
 target_include_directories(client PRIVATE
     "${CLIENT_BUILD_DIR}"
     "${CMAKE_SOURCE_DIR}/src/client"
