@@ -1,4 +1,5 @@
 #include <iostream>
+using std::cout;
 
 #include "shared/items.h"
 #include "shared/tiles.h"

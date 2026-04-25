@@ -5,13 +5,14 @@
 $tile air {
   texture = none;
   durability = 0;
+  onhit = {};
 };
 
 $tile dirt {
   texture = tex_dirt_01;
   durability = 5;
   onhit = {
-    std::cout << "dirt hit\n";
+    cout << "dirt hit\n";
   };
 };
 
@@ -31,7 +32,7 @@ $pass tile {
     "texture = "texture";"
     "durability = "durability";"
     "onhit = "onhit";"
-    "}"
+    "};"
   }
 
   instance() {

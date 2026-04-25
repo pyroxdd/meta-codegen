@@ -19,7 +19,7 @@ $pass item {
   schema() {
     "item "name" {"
     "weight = "weight";"
-    "}"
+    "};"
   }
 
   instance() {

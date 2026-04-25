@@ -1,4 +1,5 @@
 #include <iostream>
+using std::cout;
 
 enum tile_texture {
     none,

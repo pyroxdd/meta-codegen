@@ -1,11 +1,8 @@
 """
-aot_transpiler.py
-
 Scans shared source files for $ markers, generates target-specific headers,
 and writes cleaned copies of the shared sources into each target build folder.
 
-Usage:
-    python aot_transpiler.py <shared_dir> <gen_py_dir> <out_base_dir> <tag=file>...
+Usage can be found at start of main()
 """
 
 import re
@@ -18,6 +15,7 @@ from pathlib import Path
 MARKER = "\n$"
 MARKER_LEN = 1
 SYNTAX_HINTS_INCLUDE = '#include "../../build/syntax_hints.h"'
+GENERATED_SYNTAX_HINTS_INCLUDE = '#include "../../syntax_hints.h"'
 
 
 @dataclass
@@ -33,10 +31,15 @@ class MarkerBlock:
 class PassDef:
     name: str
     block_keyword: str
-    name_field: str
-    fields: dict[str, str]
+    schema: list["SchemaPart"]
     init_vars: dict
     instance_ops: list[tuple[str, str]]
+
+
+@dataclass
+class SchemaPart:
+    kind: str
+    value: str
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
@@ -83,70 +86,164 @@ def unwrap_section_body(body: str) -> str:
     return "\n".join(lines)
 
 
-def parse_what_template(what_body: str) -> tuple[str, str, dict[str, str]]:
-    lines = unwrap_schema_string(what_body).strip().splitlines()
-    header = lines[0].strip()
-    m = re.match(r'(\w+)\s+"(\w+)"\s*\{', header)
-    if not m:
-        raise ValueError(f"Invalid schema header: {header!r}")
+def parse_schema_template(schema_body: str, pass_name: str, file: Path) -> list[SchemaPart]:
+    source = textwrap.dedent(schema_body).strip()
+    if not source:
+        raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
 
-    fields = {}
-    for line in lines[1:]:
-        line = line.strip()
-        if not line or line in ("{", "}"):
+    if re.search(r"<\s*[A-Za-z_]\w*\s*>", source):
+        parts = parse_raw_schema_template(source)
+    else:
+        parts = parse_legacy_schema_template(source, pass_name, file)
+
+    if not parts:
+        raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
+
+    compact: list[SchemaPart] = []
+    for part in parts:
+        if compact and compact[-1].kind == part.kind == "literal":
+            compact[-1].value += part.value
             continue
-        fm = re.match(r'(\w+)\s*=\s*"(\w+)"\s*;', line)
-        if fm:
-            fields[fm.group(1)] = fm.group(2)
+        if compact and compact[-1].kind == part.kind == "capture":
+            raise ValueError(f"$pass {pass_name} schema in {file} has adjacent captures without literal syntax between them")
+        compact.append(part)
 
-    return m.group(1), m.group(2), fields
+    first_literal = next((part.value for part in compact if part.kind == "literal" and part.value.strip()), "")
+    if not first_literal:
+        raise ValueError(f"$pass {pass_name} schema in {file} must begin with literal syntax")
+
+    if not schema_starts_with_keyword(first_literal, pass_name):
+        raise ValueError(f"$pass {pass_name} schema in {file} must begin with {pass_name!r}")
+
+    return compact
 
 
-def unwrap_schema_string(schema_body: str) -> str:
-    lines = []
-    for raw_line in textwrap.dedent(schema_body).strip().splitlines():
-        line = raw_line.strip()
-        if not line:
+def parse_raw_schema_template(source: str) -> list[SchemaPart]:
+    wrapped = parse_wrapped_schema_literal(source)
+    if wrapped is not None:
+        source = wrapped
+
+    parts = []
+    literal = []
+    i = 0
+    while i < len(source):
+        if source[i] == "<":
+            end = source.find(">", i + 1)
+            if end == -1:
+                raise ValueError(f"Unterminated schema capture in {source!r}")
+            name = source[i + 1:end].strip()
+            if not re.fullmatch(r"[A-Za-z_]\w*", name):
+                raise ValueError(f"Invalid schema capture name <{name}>")
+            if literal:
+                parts.append(SchemaPart("literal", "".join(literal)))
+                literal = []
+            parts.append(SchemaPart("capture", name))
+            i = end + 1
             continue
-        if line.startswith('"') and line.endswith('"'):
-            line = line[1:-1]
-        lines.append(line)
-    return "\n".join(lines)
+        literal.append(source[i])
+        i += 1
+
+    if literal:
+        parts.append(SchemaPart("literal", "".join(literal)))
+    return parts
 
 
-def find_assignment_value(body: str, name: str) -> str:
-    m = re.search(rf'\b{re.escape(name)}\b\s*=', body)
-    if not m:
-        return ""
+def parse_wrapped_schema_literal(source: str) -> str | None:
+    source = source.strip()
+    if len(source) < 2 or source[0] not in "\"'" or source[-1] != source[0]:
+        return None
 
-    start = m.end()
-    depth = 0
-    for i in range(start, len(body)):
-        ch = body[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth = max(depth - 1, 0)
-        elif ch == ";" and depth == 0:
-            return normalize_assignment_value(body[start:i].strip())
+    quote = source[0]
+    value = []
+    escaped = False
+    for i in range(1, len(source) - 1):
+        ch = source[i]
+        if escaped:
+            value.append(unescape_schema_char(ch))
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == quote:
+            return None
+        value.append(ch)
 
-    raise ValueError(f"Unterminated assignment for {name}")
+    if escaped:
+        raise ValueError("Schema literal ends with a trailing escape")
+    return "".join(value)
 
 
-def normalize_assignment_value(value: str) -> str:
-    if not value.startswith("{") or not value.endswith("}"):
-        return value
+def parse_legacy_schema_template(source: str, pass_name: str, file: Path) -> list[SchemaPart]:
+    parts = []
+    i = 0
+    while i < len(source):
+        if source[i].isspace():
+            while i < len(source) and source[i].isspace():
+                i += 1
+            parts.append(SchemaPart("literal", " "))
+            continue
 
-    depth = 0
-    for i, ch in enumerate(value):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and i != len(value) - 1:
-                return value
+        if source[i] in "\"'":
+            literal, i = parse_schema_string_literal(source, i)
+            parts.append(SchemaPart("literal", literal))
+            continue
 
-    return textwrap.dedent(value[1:-1]).strip() + "\n"
+        ident = re.match(r"[A-Za-z_]\w*", source[i:])
+        if ident:
+            parts.append(SchemaPart("capture", ident.group(0)))
+            i += len(ident.group(0))
+            continue
+
+        raise ValueError(f"Invalid schema syntax in $pass {pass_name} in {file}: {source[i:i+20]!r}")
+
+    return parts
+
+
+def parse_schema_string_literal(source: str, start: int) -> tuple[str, int]:
+    quote = source[start]
+    value = []
+    i = start + 1
+    escaped = False
+
+    while i < len(source):
+        ch = source[i]
+        if escaped:
+            value.append(unescape_schema_char(ch))
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        if ch == quote:
+            return "".join(value), i + 1
+        value.append(ch)
+        i += 1
+
+    raise ValueError("Unterminated schema string literal")
+
+
+def unescape_schema_char(ch: str) -> str:
+    escapes = {
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "\\": "\\",
+        "\"": "\"",
+        "'": "'",
+    }
+    return escapes.get(ch, ch)
+
+
+def schema_starts_with_keyword(literal: str, keyword: str) -> bool:
+    stripped = literal.lstrip()
+    if not stripped.startswith(keyword):
+        return False
+    if len(stripped) == len(keyword):
+        return True
+    return not (stripped[len(keyword)].isalnum() or stripped[len(keyword)] == "_")
 
 
 def run_init_python(source: str, file: Path) -> dict:
@@ -212,15 +309,10 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     if missing:
         raise ValueError(f"$pass {name} is missing section(s): {', '.join(missing)}")
 
-    block_keyword, name_field, fields = parse_what_template(sections["schema"])
-    if block_keyword != name:
-        raise ValueError(f"$pass {name} has schema block for {block_keyword}")
-
     return PassDef(
         name=name,
-        block_keyword=block_keyword,
-        name_field=name_field,
-        fields=fields,
+        block_keyword=name,
+        schema=parse_schema_template(sections["schema"], name, file),
         init_vars=run_init_python(sections.get("python", ""), file),
         instance_ops=parse_instance_section(sections["instance"]),
     )
@@ -270,19 +362,178 @@ def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, lis
 
 
 def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
-    pattern = re.compile(
-        rf'^{pass_def.block_keyword}\s+(?P<{pass_def.name_field}>\w+)\s*{{(?P<__body>.*?)}}\s*;?\s*$',
-        re.DOTALL,
-    )
-    m = pattern.match(block.text.strip())
-    if not m:
-        raise ValueError(f"Invalid ${pass_def.block_keyword} block in {block.file}")
+    return match_schema(block.text.strip(), pass_def.schema, block.file, pass_def.name)
 
-    values = m.groupdict()
-    body = values.pop("__body")
-    for source_field, target_field in pass_def.fields.items():
-        values[target_field] = find_assignment_value(body, source_field)
+
+def match_schema(source: str, schema: list[SchemaPart], file: Path, pass_name: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    pos = 0
+
+    for index, part in enumerate(schema):
+        if part.kind == "literal":
+            end = match_schema_literal(source, pos, part.value)
+            if end is None:
+                snippet = source[pos:pos + 40]
+                raise ValueError(
+                    f"Syntax error in ${pass_name} block in {file}: expected {part.value!r} near {snippet!r}"
+                )
+            pos = end
+            continue
+
+        next_literal = next(
+            (future.value for future in schema[index + 1:] if future.kind == "literal" and future.value),
+            None,
+        )
+        if next_literal is None:
+            captured = source[pos:].strip()
+            if not captured:
+                raise ValueError(f"Syntax error in ${pass_name} block in {file}: capture {part.value!r} is empty")
+            values[part.value] = captured
+            pos = len(source)
+            continue
+
+        capture_end = find_capture_end(source, pos, next_literal)
+        if capture_end is None:
+            raise ValueError(
+                f"Syntax error in ${pass_name} block in {file}: could not find the end of capture {part.value!r}"
+            )
+
+        captured = source[pos:capture_end].strip()
+        if not captured:
+            raise ValueError(f"Syntax error in ${pass_name} block in {file}: capture {part.value!r} is empty")
+        values[part.value] = captured
+        pos = capture_end
+
+    if pos != len(source):
+        trailing = source[pos:].strip()
+        if trailing:
+            raise ValueError(f"Syntax error in ${pass_name} block in {file}: unexpected trailing syntax {trailing!r}")
+
     return values
+
+
+def match_schema_literal(source: str, start: int, literal: str) -> int | None:
+    i = start
+    j = 0
+
+    while j < len(literal):
+        if literal[j].isspace():
+            while j < len(literal) and literal[j].isspace():
+                j += 1
+            i, consumed = skip_c_whitespace(source, i)
+            if not consumed:
+                return None
+            continue
+
+        if i >= len(source) or source[i] != literal[j]:
+            return None
+        i += 1
+        j += 1
+
+    return i
+
+
+def skip_c_whitespace(source: str, start: int) -> tuple[int, bool]:
+    i = start
+    consumed = False
+
+    while i < len(source):
+        if source[i].isspace():
+            consumed = True
+            i += 1
+            continue
+
+        if source.startswith("//", i):
+            consumed = True
+            i += 2
+            while i < len(source) and source[i] != "\n":
+                i += 1
+            continue
+
+        if source.startswith("/*", i):
+            consumed = True
+            end = source.find("*/", i + 2)
+            if end == -1:
+                raise ValueError("Unterminated block comment")
+            i = end + 2
+            continue
+
+        break
+
+    return i, consumed
+
+
+def find_capture_end(source: str, start: int, next_literal: str) -> int | None:
+    brace_depth = 0
+    bracket_depth = 0
+    paren_depth = 0
+    in_string = False
+    in_char = False
+    escaped = False
+    i = start
+
+    while i < len(source):
+        if not in_string and not in_char:
+            if source.startswith("//", i):
+                i += 2
+                while i < len(source) and source[i] != "\n":
+                    i += 1
+                continue
+            if source.startswith("/*", i):
+                end = source.find("*/", i + 2)
+                if end == -1:
+                    raise ValueError("Unterminated block comment")
+                i = end + 2
+                continue
+
+        if not in_string and not in_char and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
+            end = match_schema_literal(source, i, next_literal)
+            if end is not None:
+                return i
+
+        ch = source[i]
+
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if in_char:
+            if ch == "\\":
+                escaped = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "'":
+            in_char = True
+        elif ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            brace_depth -= 1
+        elif ch == "[":
+            bracket_depth += 1
+        elif ch == "]":
+            bracket_depth -= 1
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+
+        i += 1
+
+    return None
 
 
 def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
@@ -644,14 +895,16 @@ def strip_blocks(source: str, blocks: list[MarkerBlock]) -> str:
 
 
 def ensure_syntax_hints_include(source: str) -> str:
-    if SYNTAX_HINTS_INCLUDE in source:
+    if GENERATED_SYNTAX_HINTS_INCLUDE in source:
         return source
+    if SYNTAX_HINTS_INCLUDE in source:
+        return source.replace(SYNTAX_HINTS_INCLUDE, GENERATED_SYNTAX_HINTS_INCLUDE)
 
     pragma = "#pragma once"
     if source.startswith(pragma):
-        return source.replace(pragma, f"{pragma}\n\n{SYNTAX_HINTS_INCLUDE}", 1)
+        return source.replace(pragma, f"{pragma}\n\n{GENERATED_SYNTAX_HINTS_INCLUDE}", 1)
 
-    return f"{SYNTAX_HINTS_INCLUDE}\n\n{source}"
+    return f"{GENERATED_SYNTAX_HINTS_INCLUDE}\n\n{source}"
 
 
 def write_generated_sources(shared_dir: Path, strip_map: dict[Path, list[MarkerBlock]], out_map: dict[str, Path]) -> None:
@@ -687,7 +940,7 @@ def write_syntax_hints(out_base: Path, pass_names: list[str]) -> Path:
 
 def main() -> None:
     if len(sys.argv) < 5:
-        print("Usage: aot_transpiler.py <shared_dir> <gen_py_dir> <out_base_dir> tag=file ...")
+        print("Usage: <this_file_name> <shared_dir> <gen_py_dir> <out_base_dir> tag=file ...")
         sys.exit(1)
 
     shared_dir = Path(sys.argv[1])
@@ -736,12 +989,12 @@ def main() -> None:
                 out_path = output_root / f"{fragment_name}.h"
                 out_path.write_text(content)
                 print(f"Written {tag}: {out_path}")
-        stamp_path.write_text("# Generated by aot_transpiler.py\n")
+        stamp_path.write_text("# Generated by codegen\n")
         print(f"Written {tag}: {stamp_path}")
 
     write_generated_sources(shared_dir, strip_map, out_map)
     write_syntax_hints(out_base, list(pass_defs))
-    gen_stamp.write_text("# Generated by aot_transpiler.py\n")
+    gen_stamp.write_text("# Generated by codegen\n")
     print(f"Written generator stamp: {gen_stamp}")
 
 
