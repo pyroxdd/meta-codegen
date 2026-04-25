@@ -6,6 +6,11 @@ enum tile_texture {
     tex_dirt_01,
 };
 
+enum tile_material {
+    empty,
+    soil,
+};
+
 #include "shared/items.h"
 #include "shared/tiles.h"
 

@@ -10,3 +10,7 @@ struct tile {
 tile_texture tile_textures[] = {
 #include "textures.h"
 };
+
+tile_material tile_materials[] = {
+#include "materials.h"
+};

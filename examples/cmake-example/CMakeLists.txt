@@ -21,6 +21,7 @@ set(CURSOR_HEADERS
     tiles.h
     hits.h
     textures.h
+    materials.h
     item_decls.h
     items.h
     item_weights.h

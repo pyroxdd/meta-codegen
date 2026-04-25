@@ -8,6 +8,10 @@ struct tile {
 
 #include "tiles.h"
 
+tile_material tile_materials[] = {
+#include "materials.h"
+};
+
 inline bool tile::hit(int power) const {
     switch(index) {
 #include "hits.h"

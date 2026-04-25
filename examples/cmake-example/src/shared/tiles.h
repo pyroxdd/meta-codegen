@@ -5,11 +5,13 @@
 $tile air {
   texture = none;
   durability = 0;
+  material = empty;
 };
 
 $tile dirt {
   texture = tex_dirt_01;
   durability = 5;
+  surface = soil;
   onhit = {
     cout << "dirt hit\n";
   };
@@ -25,12 +27,14 @@ $pass tile {
   tiles = []
   hits = []
   textures = []
+  materials = []
 
   schema() {
     "tile "name" {"
     "texture = "texture";"
     "durability = "durability";"
-    ["onhit = "onhit";"]
+    ["material = "material";"|"surface = "material";"|"kind = "material";"]
+    ["onhit = "onhit";"|]
     "};"
   }
 
@@ -38,6 +42,7 @@ $pass tile {
     tile_decls += "static const tile "name";"
     tiles += "inline constexpr tile tile::"name" = {"count++"};"
     textures += texture","
+    materials += material","
     hits += "case tile::"name".index: {"
     hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
     hits += "} break;"

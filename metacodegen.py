@@ -40,7 +40,7 @@ class PassDef:
 class SchemaPart:
     kind: str
     value: str = ""
-    children: list["SchemaPart"] | None = None
+    alternatives: list[list["SchemaPart"]] | None = None
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
@@ -155,7 +155,7 @@ def parse_legacy_schema_template(source: str, pass_name: str, file: Path) -> lis
     return parts
 
 
-def parse_raw_schema_parts(source: str, start: int, in_optional: bool) -> tuple[list[SchemaPart], int]:
+def parse_raw_schema_parts(source: str, start: int, in_branch: bool) -> tuple[list[SchemaPart], int]:
     parts = []
     literal = []
     i = start
@@ -163,18 +163,17 @@ def parse_raw_schema_parts(source: str, start: int, in_optional: bool) -> tuple[
     while i < len(source):
         ch = source[i]
         if ch == "]":
-            if not in_optional:
+            if not in_branch:
                 raise ValueError("Unexpected closing ] in schema")
+            break
+        if ch == "|" and in_branch:
             break
         if ch == "[":
             if literal:
                 parts.append(SchemaPart("literal", "".join(literal)))
                 literal = []
-            children, i = parse_raw_schema_parts(source, i + 1, True)
-            if i >= len(source) or source[i] != "]":
-                raise ValueError("Unterminated optional schema group")
-            parts.append(SchemaPart("optional", children=children))
-            i += 1
+            branch, i = parse_raw_schema_branch(source, i + 1)
+            parts.append(branch)
             continue
         if ch == "<":
             end = source.find(">", i + 1)
@@ -197,10 +196,31 @@ def parse_raw_schema_parts(source: str, start: int, in_optional: bool) -> tuple[
     return parts, i
 
 
+def parse_raw_schema_branch(source: str, start: int) -> tuple[SchemaPart, int]:
+    alternatives = []
+    saw_separator = False
+    i = start
+
+    while True:
+        parts, i = parse_raw_schema_parts(source, i, True)
+        alternatives.append(parts)
+        if i >= len(source):
+            raise ValueError("Unterminated schema branch")
+        if source[i] == "|":
+            saw_separator = True
+            i += 1
+            continue
+        if source[i] == "]":
+            if not saw_separator:
+                raise ValueError("Schema branch must contain '|'")
+            return SchemaPart("branch", alternatives=alternatives), i + 1
+        raise ValueError(f"Invalid schema branch syntax near {source[i:i+20]!r}")
+
+
 def parse_legacy_schema_parts(
     source: str,
     start: int,
-    in_optional: bool,
+    in_branch: bool,
     pass_name: str,
     file: Path,
 ) -> tuple[list[SchemaPart], int]:
@@ -210,15 +230,14 @@ def parse_legacy_schema_parts(
     while i < len(source):
         ch = source[i]
         if ch == "]":
-            if not in_optional:
+            if not in_branch:
                 raise ValueError(f"Unexpected closing ] in $pass {pass_name} schema in {file}")
             break
+        if ch == "|" and in_branch:
+            break
         if ch == "[":
-            children, i = parse_legacy_schema_parts(source, i + 1, True, pass_name, file)
-            if i >= len(source) or source[i] != "]":
-                raise ValueError(f"Unterminated optional schema group in $pass {pass_name} in {file}")
-            parts.append(SchemaPart("optional", children=children))
-            i += 1
+            branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file)
+            parts.append(branch)
             continue
         if ch.isspace():
             while i < len(source) and source[i].isspace():
@@ -239,17 +258,41 @@ def parse_legacy_schema_parts(
     return parts, i
 
 
+def parse_legacy_schema_branch(source: str, start: int, pass_name: str, file: Path) -> tuple[SchemaPart, int]:
+    alternatives = []
+    saw_separator = False
+    i = start
+
+    while True:
+        parts, i = parse_legacy_schema_parts(source, i, True, pass_name, file)
+        alternatives.append(parts)
+        if i >= len(source):
+            raise ValueError(f"Unterminated schema branch in $pass {pass_name} in {file}")
+        if source[i] == "|":
+            saw_separator = True
+            i += 1
+            continue
+        if source[i] == "]":
+            if not saw_separator:
+                raise ValueError(f"Schema branch in $pass {pass_name} in {file} must contain '|'")
+            return SchemaPart("branch", alternatives=alternatives), i + 1
+        raise ValueError(f"Invalid schema branch in $pass {pass_name} in {file}: {source[i:i+20]!r}")
+
+
 def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) -> list[SchemaPart]:
     compact: list[SchemaPart] = []
     previous_can_end_with_capture = False
 
     for part in parts:
-        if part.kind == "optional":
-            children = compact_schema_parts(part.children or [], pass_name, file)
-            if not children:
+        if part.kind == "branch":
+            alternatives = [
+                compact_schema_parts(alternative, pass_name, file)
+                for alternative in part.alternatives or []
+            ]
+            if not any(alternatives):
                 continue
-            compact.append(SchemaPart("optional", children=children))
-            previous_can_end_with_capture = schema_ends_with_capture(children)
+            compact.append(SchemaPart("branch", alternatives=alternatives))
+            previous_can_end_with_capture = any(schema_ends_with_capture(alternative) for alternative in alternatives)
             continue
 
         if part.kind == "literal":
@@ -274,8 +317,8 @@ def schema_ends_with_capture(parts: list[SchemaPart]) -> bool:
             return False
         if part.kind == "capture":
             return True
-        if part.kind == "optional":
-            return schema_ends_with_capture(part.children or [])
+        if part.kind == "branch":
+            return any(schema_ends_with_capture(alternative) for alternative in part.alternatives or [])
     return False
 
 
@@ -283,10 +326,11 @@ def first_schema_literal(parts: list[SchemaPart]) -> str:
     for part in parts:
         if part.kind == "literal" and part.value.strip():
             return part.value
-        if part.kind == "optional":
-            literal = first_schema_literal(part.children or [])
-            if literal:
-                return literal
+        if part.kind == "branch":
+            for alternative in part.alternatives or []:
+                literal = first_schema_literal(alternative)
+                if literal:
+                    return literal
     return ""
 
 
@@ -476,7 +520,9 @@ def match_schema_nodes(
     values: dict[str, str],
 ) -> tuple[int, dict[str, str]] | None:
     if index >= len(schema):
-        return pos, values
+        if source[pos:].strip():
+            return None
+        return len(source), values
 
     part = schema[index]
     if part.kind == "literal":
@@ -485,11 +531,12 @@ def match_schema_nodes(
             return None
         return match_schema_nodes(source, schema, index + 1, end, values)
 
-    if part.kind == "optional":
-        matched = match_schema_nodes(source, (part.children or []) + schema[index + 1:], 0, pos, values.copy())
-        if matched is not None:
-            return matched
-        return match_schema_nodes(source, schema, index + 1, pos, values)
+    if part.kind == "branch":
+        for alternative in part.alternatives or []:
+            matched = match_schema_nodes(source, alternative + schema[index + 1:], 0, pos, values.copy())
+            if matched is not None:
+                return matched
+        return None
 
     if index == len(schema) - 1:
         captured = source[pos:].strip()

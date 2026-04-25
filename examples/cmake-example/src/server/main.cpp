@@ -1,6 +1,11 @@
 #include <iostream>
 using std::cout;
 
+enum tile_material {
+    empty,
+    soil,
+};
+
 #include "shared/items.h"
 #include "shared/tiles.h"
 
