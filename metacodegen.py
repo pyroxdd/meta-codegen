@@ -39,7 +39,8 @@ class PassDef:
 @dataclass
 class SchemaPart:
     kind: str
-    value: str
+    value: str = ""
+    children: list["SchemaPart"] | None = None
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
@@ -99,16 +100,8 @@ def parse_schema_template(schema_body: str, pass_name: str, file: Path) -> list[
     if not parts:
         raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
 
-    compact: list[SchemaPart] = []
-    for part in parts:
-        if compact and compact[-1].kind == part.kind == "literal":
-            compact[-1].value += part.value
-            continue
-        if compact and compact[-1].kind == part.kind == "capture":
-            raise ValueError(f"$pass {pass_name} schema in {file} has adjacent captures without literal syntax between them")
-        compact.append(part)
-
-    first_literal = next((part.value for part in compact if part.kind == "literal" and part.value.strip()), "")
+    compact = compact_schema_parts(parts, pass_name, file)
+    first_literal = first_schema_literal(compact)
     if not first_literal:
         raise ValueError(f"$pass {pass_name} schema in {file} must begin with literal syntax")
 
@@ -123,28 +116,9 @@ def parse_raw_schema_template(source: str) -> list[SchemaPart]:
     if wrapped is not None:
         source = wrapped
 
-    parts = []
-    literal = []
-    i = 0
-    while i < len(source):
-        if source[i] == "<":
-            end = source.find(">", i + 1)
-            if end == -1:
-                raise ValueError(f"Unterminated schema capture in {source!r}")
-            name = source[i + 1:end].strip()
-            if not re.fullmatch(r"[A-Za-z_]\w*", name):
-                raise ValueError(f"Invalid schema capture name <{name}>")
-            if literal:
-                parts.append(SchemaPart("literal", "".join(literal)))
-                literal = []
-            parts.append(SchemaPart("capture", name))
-            i = end + 1
-            continue
-        literal.append(source[i])
-        i += 1
-
-    if literal:
-        parts.append(SchemaPart("literal", "".join(literal)))
+    parts, end = parse_raw_schema_parts(source, 0, False)
+    if end != len(source):
+        raise ValueError(f"Unexpected trailing schema syntax: {source[end:]!r}")
     return parts
 
 
@@ -175,29 +149,145 @@ def parse_wrapped_schema_literal(source: str) -> str | None:
 
 
 def parse_legacy_schema_template(source: str, pass_name: str, file: Path) -> list[SchemaPart]:
+    parts, end = parse_legacy_schema_parts(source, 0, False, pass_name, file)
+    if end != len(source):
+        raise ValueError(f"Invalid schema syntax in $pass {pass_name} in {file}: {source[end:end+20]!r}")
+    return parts
+
+
+def parse_raw_schema_parts(source: str, start: int, in_optional: bool) -> tuple[list[SchemaPart], int]:
     parts = []
-    i = 0
+    literal = []
+    i = start
+
     while i < len(source):
-        if source[i].isspace():
+        ch = source[i]
+        if ch == "]":
+            if not in_optional:
+                raise ValueError("Unexpected closing ] in schema")
+            break
+        if ch == "[":
+            if literal:
+                parts.append(SchemaPart("literal", "".join(literal)))
+                literal = []
+            children, i = parse_raw_schema_parts(source, i + 1, True)
+            if i >= len(source) or source[i] != "]":
+                raise ValueError("Unterminated optional schema group")
+            parts.append(SchemaPart("optional", children=children))
+            i += 1
+            continue
+        if ch == "<":
+            end = source.find(">", i + 1)
+            if end == -1:
+                raise ValueError(f"Unterminated schema capture in {source!r}")
+            name = source[i + 1:end].strip()
+            if not re.fullmatch(r"[A-Za-z_]\w*", name):
+                raise ValueError(f"Invalid schema capture name <{name}>")
+            if literal:
+                parts.append(SchemaPart("literal", "".join(literal)))
+                literal = []
+            parts.append(SchemaPart("capture", name))
+            i = end + 1
+            continue
+        literal.append(ch)
+        i += 1
+
+    if literal:
+        parts.append(SchemaPart("literal", "".join(literal)))
+    return parts, i
+
+
+def parse_legacy_schema_parts(
+    source: str,
+    start: int,
+    in_optional: bool,
+    pass_name: str,
+    file: Path,
+) -> tuple[list[SchemaPart], int]:
+    parts = []
+    i = start
+
+    while i < len(source):
+        ch = source[i]
+        if ch == "]":
+            if not in_optional:
+                raise ValueError(f"Unexpected closing ] in $pass {pass_name} schema in {file}")
+            break
+        if ch == "[":
+            children, i = parse_legacy_schema_parts(source, i + 1, True, pass_name, file)
+            if i >= len(source) or source[i] != "]":
+                raise ValueError(f"Unterminated optional schema group in $pass {pass_name} in {file}")
+            parts.append(SchemaPart("optional", children=children))
+            i += 1
+            continue
+        if ch.isspace():
             while i < len(source) and source[i].isspace():
                 i += 1
             parts.append(SchemaPart("literal", " "))
             continue
-
-        if source[i] in "\"'":
+        if ch in "\"'":
             literal, i = parse_schema_string_literal(source, i)
             parts.append(SchemaPart("literal", literal))
             continue
-
         ident = re.match(r"[A-Za-z_]\w*", source[i:])
         if ident:
             parts.append(SchemaPart("capture", ident.group(0)))
             i += len(ident.group(0))
             continue
-
         raise ValueError(f"Invalid schema syntax in $pass {pass_name} in {file}: {source[i:i+20]!r}")
 
-    return parts
+    return parts, i
+
+
+def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) -> list[SchemaPart]:
+    compact: list[SchemaPart] = []
+    previous_can_end_with_capture = False
+
+    for part in parts:
+        if part.kind == "optional":
+            children = compact_schema_parts(part.children or [], pass_name, file)
+            if not children:
+                continue
+            compact.append(SchemaPart("optional", children=children))
+            previous_can_end_with_capture = schema_ends_with_capture(children)
+            continue
+
+        if part.kind == "literal":
+            if compact and compact[-1].kind == "literal":
+                compact[-1].value += part.value
+            else:
+                compact.append(SchemaPart("literal", part.value))
+            previous_can_end_with_capture = False
+            continue
+
+        if previous_can_end_with_capture:
+            raise ValueError(f"$pass {pass_name} schema in {file} has adjacent captures without literal syntax between them")
+        compact.append(part)
+        previous_can_end_with_capture = True
+
+    return compact
+
+
+def schema_ends_with_capture(parts: list[SchemaPart]) -> bool:
+    for part in reversed(parts):
+        if part.kind == "literal" and part.value:
+            return False
+        if part.kind == "capture":
+            return True
+        if part.kind == "optional":
+            return schema_ends_with_capture(part.children or [])
+    return False
+
+
+def first_schema_literal(parts: list[SchemaPart]) -> str:
+    for part in parts:
+        if part.kind == "literal" and part.value.strip():
+            return part.value
+        if part.kind == "optional":
+            literal = first_schema_literal(part.children or [])
+            if literal:
+                return literal
+    return ""
 
 
 def parse_schema_string_literal(source: str, start: int) -> tuple[str, int]:
@@ -366,50 +456,60 @@ def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
 
 
 def match_schema(source: str, schema: list[SchemaPart], file: Path, pass_name: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    pos = 0
+    result = match_schema_nodes(source, schema, 0, 0, {})
+    if result is None:
+        snippet = source[:40]
+        raise ValueError(f"Syntax error in ${pass_name} block in {file}: could not match schema near {snippet!r}")
 
-    for index, part in enumerate(schema):
-        if part.kind == "literal":
-            end = match_schema_literal(source, pos, part.value)
-            if end is None:
-                snippet = source[pos:pos + 40]
-                raise ValueError(
-                    f"Syntax error in ${pass_name} block in {file}: expected {part.value!r} near {snippet!r}"
-                )
-            pos = end
-            continue
+    pos, values = result
+    trailing = source[pos:].strip()
+    if trailing:
+        raise ValueError(f"Syntax error in ${pass_name} block in {file}: unexpected trailing syntax {trailing!r}")
+    return values
 
-        next_literal = next(
-            (future.value for future in schema[index + 1:] if future.kind == "literal" and future.value),
-            None,
-        )
-        if next_literal is None:
-            captured = source[pos:].strip()
-            if not captured:
-                raise ValueError(f"Syntax error in ${pass_name} block in {file}: capture {part.value!r} is empty")
-            values[part.value] = captured
-            pos = len(source)
-            continue
 
-        capture_end = find_capture_end(source, pos, next_literal)
-        if capture_end is None:
-            raise ValueError(
-                f"Syntax error in ${pass_name} block in {file}: could not find the end of capture {part.value!r}"
-            )
+def match_schema_nodes(
+    source: str,
+    schema: list[SchemaPart],
+    index: int,
+    pos: int,
+    values: dict[str, str],
+) -> tuple[int, dict[str, str]] | None:
+    if index >= len(schema):
+        return pos, values
 
+    part = schema[index]
+    if part.kind == "literal":
+        end = match_schema_literal(source, pos, part.value)
+        if end is None:
+            return None
+        return match_schema_nodes(source, schema, index + 1, end, values)
+
+    if part.kind == "optional":
+        matched = match_schema_nodes(source, (part.children or []) + schema[index + 1:], 0, pos, values.copy())
+        if matched is not None:
+            return matched
+        return match_schema_nodes(source, schema, index + 1, pos, values)
+
+    if index == len(schema) - 1:
+        captured = source[pos:].strip()
+        if not captured:
+            return None
+        next_values = values.copy()
+        next_values[part.value] = captured
+        return len(source), next_values
+
+    for capture_end in iter_capture_end_positions(source, pos):
         captured = source[pos:capture_end].strip()
         if not captured:
-            raise ValueError(f"Syntax error in ${pass_name} block in {file}: capture {part.value!r} is empty")
-        values[part.value] = captured
-        pos = capture_end
+            continue
+        next_values = values.copy()
+        next_values[part.value] = captured
+        matched = match_schema_nodes(source, schema, index + 1, capture_end, next_values)
+        if matched is not None:
+            return matched
 
-    if pos != len(source):
-        trailing = source[pos:].strip()
-        if trailing:
-            raise ValueError(f"Syntax error in ${pass_name} block in {file}: unexpected trailing syntax {trailing!r}")
-
-    return values
+    return None
 
 
 def match_schema_literal(source: str, start: int, literal: str) -> int | None:
@@ -420,9 +520,7 @@ def match_schema_literal(source: str, start: int, literal: str) -> int | None:
         if literal[j].isspace():
             while j < len(literal) and literal[j].isspace():
                 j += 1
-            i, consumed = skip_c_whitespace(source, i)
-            if not consumed:
-                return None
+            i, _ = skip_c_whitespace(source, i)
             continue
 
         if i >= len(source) or source[i] != literal[j]:
@@ -463,7 +561,8 @@ def skip_c_whitespace(source: str, start: int) -> tuple[int, bool]:
     return i, consumed
 
 
-def find_capture_end(source: str, start: int, next_literal: str) -> int | None:
+def iter_capture_end_positions(source: str, start: int):
+    yield start
     brace_depth = 0
     bracket_depth = 0
     paren_depth = 0
@@ -484,12 +583,9 @@ def find_capture_end(source: str, start: int, next_literal: str) -> int | None:
                 if end == -1:
                     raise ValueError("Unterminated block comment")
                 i = end + 2
+                if brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
+                    yield i
                 continue
-
-        if not in_string and not in_char and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
-            end = match_schema_literal(source, i, next_literal)
-            if end is not None:
-                return i
 
         ch = source[i]
 
@@ -532,8 +628,8 @@ def find_capture_end(source: str, start: int, next_literal: str) -> int | None:
             paren_depth -= 1
 
         i += 1
-
-    return None
+        if not in_string and not in_char and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
+            yield i
 
 
 def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:

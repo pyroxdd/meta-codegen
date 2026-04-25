@@ -5,7 +5,6 @@
 $tile air {
   texture = none;
   durability = 0;
-  onhit = {};
 };
 
 $tile dirt {
@@ -31,7 +30,7 @@ $pass tile {
     "tile "name" {"
     "texture = "texture";"
     "durability = "durability";"
-    "onhit = "onhit";"
+    ["onhit = "onhit";"]
     "};"
   }
 
