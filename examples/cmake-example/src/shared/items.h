@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../build/syntax_hints.h"
+#include "syntax_hints.h"
 
 $item coin {
   weight = 1;
