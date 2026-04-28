@@ -101,13 +101,6 @@ def parse_schema_template(schema_body: str, pass_name: str, file: Path) -> list[
         raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
 
     compact = compact_schema_parts(parts, pass_name, file)
-    first_literal = first_schema_literal(compact)
-    if not first_literal:
-        raise ValueError(f"$pass {pass_name} schema in {file} must begin with literal syntax")
-
-    if not schema_starts_with_keyword(first_literal, pass_name):
-        raise ValueError(f"$pass {pass_name} schema in {file} must begin with {pass_name!r}")
-
     return compact
 
 
@@ -489,16 +482,68 @@ def marker_positions(source: str) -> list[int]:
 def block_end(text: str, start: int) -> int:
     depth = 0
     saw_open = False
+    in_string = False
+    string_quote = ""
+    escape = False
+    in_line_comment = False
+    in_block_comment = False
+
     for i in range(start, len(text)):
-        if text[i] == "{":
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == string_quote:
+                in_string = False
+                string_quote = ""
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            continue
+
+        if ch in ("'", '"'):
+            in_string = True
+            string_quote = ch
+            escape = False
+            continue
+
+        if ch == "{":
             depth += 1
             saw_open = True
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if saw_open and depth == 0:
                 end = i + 1
-                while end < len(text) and text[end].isspace() and text[end] != "\n":
-                    end += 1
+                while True:
+                    probe = end
+                    while probe < len(text) and text[probe].isspace():
+                        probe += 1
+                    if probe < len(text) and text[probe] == "{":
+                        sibling_end = block_end(text, probe)
+                        end = sibling_end
+                        continue
+                    break
                 if end < len(text) and text[end] == ";":
                     end += 1
                 return end
@@ -536,6 +581,30 @@ def discover_blocks(
 
 def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
     return match_schema(block.text.strip(), pass_def.schema, block.file, pass_def.name)
+
+
+def identify_pass(block: MarkerBlock, pass_defs: dict[str, PassDef]) -> tuple[str, dict[str, str]]:
+    matches: list[tuple[str, dict[str, str]]] = []
+    for name, pass_def in pass_defs.items():
+        try:
+            values = parse_instance(block, pass_def)
+        except ValueError:
+            continue
+        values = values.copy()
+        values["_source"] = block.text.strip()
+        values["_file"] = str(block.file)
+        matches.append((name, values))
+
+    if not matches:
+        snippet = block.text.strip()[:40]
+        raise ValueError(f"Unknown $ block in {block.file}: could not match schema near {snippet!r}")
+
+    if len(matches) > 1:
+        names = ", ".join(name for name, _ in matches)
+        snippet = block.text.strip()[:40]
+        raise ValueError(f"Ambiguous $ block in {block.file}: matched [{names}] near {snippet!r}")
+
+    return matches[0]
 
 
 def match_schema(source: str, schema: list[SchemaPart], file: Path, pass_name: str) -> dict[str, str]:
@@ -579,16 +648,12 @@ def match_schema_nodes(
 
     if index == len(schema) - 1:
         captured = source[pos:].strip()
-        if not captured:
-            return None
         next_values = values.copy()
         next_values[part.value] = captured
         return len(source), next_values
 
     for capture_end in iter_capture_end_positions(source, pos):
         captured = source[pos:capture_end].strip()
-        if not captured:
-            continue
         next_values = values.copy()
         next_values[part.value] = captured
         matched = match_schema_nodes(source, schema, index + 1, capture_end, next_values)
@@ -725,6 +790,26 @@ def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
     return ""
 
 
+def render_python_expr(expr: str, fields: dict[str, str], counters: dict) -> str | None:
+    def post_inc(name: str):
+        value = counters.get(name, 0)
+        counters[name] = value + 1
+        return value
+
+    translated = re.sub(r"\b([A-Za-z_]\w*)\+\+", lambda m: f'__post_inc__("{m.group(1)}")', expr)
+    scope = {}
+    scope.update(counters)
+    scope.update(fields)
+    scope["__post_inc__"] = post_inc
+    try:
+        value = eval(translated, {"__builtins__": {}}, scope)
+    except Exception:
+        return None
+    if value is None:
+        return ""
+    return str(value)
+
+
 def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
     expr = expr.strip()
 
@@ -743,6 +828,10 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
     concat = render_implicit_concat(expr, fields, counters)
     if concat is not None:
         return concat
+
+    python_value = render_python_expr(expr, fields, counters)
+    if python_value is not None:
+        return python_value
 
     parts = split_top_level(expr, "+")
     if len(parts) > 1:
@@ -972,7 +1061,10 @@ def render_concat_atom(expr: str, fields: dict[str, str], counters: dict) -> str
         return render_expr(expr, fields, counters)
     if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
         return render_value(expr, fields, counters)
-    return render_variable(expr, fields, counters)
+    value = render_variable(expr, fields, counters)
+    if value is not None:
+        return value
+    return render_python_expr(expr, fields, counters)
 
 
 def split_top_level(expr: str, separator: str) -> list[str]:
@@ -1037,8 +1129,13 @@ def format_cpp_like(source: str) -> str:
 def render_fragments(pass_def: PassDef, instances: list[dict[str, str]]) -> dict[str, str]:
     import copy
 
-    state = copy.deepcopy(pass_def.init_vars)
-    counters = {k: v for k, v in state.items() if isinstance(v, int)}
+    state = {}
+    for key, value in pass_def.init_vars.items():
+        if isinstance(value, (list, dict, set, tuple)):
+            state[key] = copy.deepcopy(value)
+        else:
+            state[key] = value
+    counters = state
     accs = {k: v for k, v in state.items() if isinstance(v, list)}
 
     for fields in instances:
@@ -1137,6 +1234,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             shared_dir=Path(argv[0]),
             output_root=Path(argv[2]),
             shared_output_root=None,
+            generated_header_prefix="",
             syntax_hints=None,
             no_syntax_hints=False,
             source_suffixes=list(DEFAULT_SOURCE_SUFFIXES),
@@ -1161,6 +1259,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional extra directory for stripped shared sources in addition to per-target outputs",
+    )
+    parser.add_argument(
+        "--generated-header-prefix",
+        default="",
+        help="Optional prefix added to generated fragment header filenames such as prefab.h -> <prefix>prefab.h",
     )
     parser.add_argument(
         "--target",
@@ -1220,11 +1323,8 @@ def main(argv: list[str] | None = None) -> int:
         if stripped.startswith("pass"):
             continue
 
-        marker_name = stripped.split(None, 1)[0]
-        pass_def = pass_defs.get(marker_name)
-        if pass_def is None:
-            raise ValueError(f"Unknown ${marker_name} block in {block.file}")
-        instances_by_pass[marker_name].append(parse_instance(block, pass_def))
+        pass_name, values = identify_pass(block, pass_defs)
+        instances_by_pass[pass_name].append(values)
 
     for tag, stamp_path in out_map.items():
         target_root = stamp_path.parent
@@ -1232,7 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
         for name, pass_def in pass_defs.items():
             fragments = render_fragments(pass_def, instances_by_pass[name])
             for fragment_name, content in fragments.items():
-                out_path = target_root / f"{fragment_name}.h"
+                out_path = target_root / f"{args.generated_header_prefix}{fragment_name}.h"
                 out_path.write_text(content)
                 print(f"Written {tag}: {out_path}")
         write_generated_sources(shared_dir, strip_map, target_root, source_suffixes)

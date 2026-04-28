@@ -2,15 +2,15 @@
 
 struct tile {
     int index;
-#include "tile_decls.h"
+#include "g_tile_decls.h"
 };
 
-#include "tiles.h"
+#include "g_tiles.h"
 
 tile_texture tile_textures[] = {
-#include "textures.h"
+#include "g_textures.h"
 };
 
 tile_material tile_materials[] = {
-#include "materials.h"
+#include "g_materials.h"
 };

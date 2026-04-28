@@ -2,14 +2,14 @@
 
 struct item {
     int index;
-#include "item_decls.h"
+#include "g_item_decls.h"
 };
 
-#include "items.h"
+#include "g_items.h"
 
 inline int item_weight(item value) {
     static constexpr int weights[] = {
-#include "item_weights.h"
+#include "g_item_weights.h"
     };
     return weights[value.index];
 }

@@ -3,18 +3,18 @@
 struct tile {
     int index;
     bool hit(int power) const;
-#include "tile_decls.h"
+#include "g_tile_decls.h"
 };
 
-#include "tiles.h"
+#include "g_tiles.h"
 
 tile_material tile_materials[] = {
-#include "materials.h"
+#include "g_materials.h"
 };
 
 inline bool tile::hit(int power) const {
     switch(index) {
-#include "hits.h"
+#include "g_hits.h"
     default: return false;
     }
     return false;
