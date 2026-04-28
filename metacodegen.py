@@ -5,6 +5,7 @@ and writes cleaned copies of the shared sources into each target build folder.
 Usage can be found at start of main()
 """
 
+import argparse
 import re
 import sys
 import textwrap
@@ -14,8 +15,7 @@ from pathlib import Path
 
 MARKER = "\n$"
 MARKER_LEN = 1
-SYNTAX_HINTS_INCLUDE = '#include "../../build/syntax_hints.h"'
-GENERATED_SYNTAX_HINTS_INCLUDE = '#include "../../syntax_hints.h"'
+DEFAULT_SOURCE_SUFFIXES = (".h", ".hh", ".hpp", ".hxx", ".c", ".cc", ".cpp", ".cxx")
 
 
 @dataclass
@@ -475,18 +475,27 @@ def block_end(text: str, start: int) -> int:
     raise ValueError("Unclosed $ block")
 
 
-def discover_blocks(shared_dir: Path) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
+def iter_source_files(shared_dir: Path, source_suffixes: tuple[str, ...]) -> list[Path]:
+    suffixes = {suffix.lower() for suffix in source_suffixes}
+    return [
+        file
+        for file in sorted(shared_dir.rglob("*"))
+        if file.is_file() and file.suffix.lower() in suffixes
+    ]
+
+
+def discover_blocks(
+    shared_dir: Path,
+    source_suffixes: tuple[str, ...],
+) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
     blocks = []
     strip_blocks: dict[Path, list[MarkerBlock]] = {}
 
-    for file in sorted(shared_dir.rglob("*.h")):
+    for file in iter_source_files(shared_dir, source_suffixes):
         source = file.read_text()
         positions = marker_positions(source)
         for index, start in enumerate(positions):
-            next_start = positions[index + 1] if index + 1 < len(positions) else len(source)
-            rest = source[start + MARKER_LEN:].lstrip()
             end = block_end(source, start)
-
             text = source[start + MARKER_LEN:end]
             block = MarkerBlock(file=file, start=start, end=end, text=text)
             blocks.append(block)
@@ -567,7 +576,7 @@ def match_schema_literal(source: str, start: int, literal: str) -> int | None:
         if literal[j].isspace():
             while j < len(literal) and literal[j].isspace():
                 j += 1
-            i, _ = skip_c_whitespace(source, i)
+            i = skip_c_whitespace(source, i)
             continue
 
         if i >= len(source) or source[i] != literal[j]:
@@ -578,25 +587,21 @@ def match_schema_literal(source: str, start: int, literal: str) -> int | None:
     return i
 
 
-def skip_c_whitespace(source: str, start: int) -> tuple[int, bool]:
+def skip_c_whitespace(source: str, start: int) -> int:
     i = start
-    consumed = False
 
     while i < len(source):
         if source[i].isspace():
-            consumed = True
             i += 1
             continue
 
         if source.startswith("//", i):
-            consumed = True
             i += 2
             while i < len(source) and source[i] != "\n":
                 i += 1
             continue
 
         if source.startswith("/*", i):
-            consumed = True
             end = source.find("*/", i + 2)
             if end == -1:
                 raise ValueError("Unterminated block comment")
@@ -605,7 +610,7 @@ def skip_c_whitespace(source: str, start: int) -> tuple[int, bool]:
 
         break
 
-    return i, consumed
+    return i
 
 
 def iter_capture_end_positions(source: str, start: int):
@@ -967,10 +972,6 @@ def split_top_level(expr: str, separator: str) -> list[str]:
     return parts
 
 
-def render_line(template: str, fields: dict[str, str], counters: dict) -> str:
-    return re.sub(r"\[(.*?)\]", lambda m: render_expr(m.group(1), fields, counters), template)
-
-
 def render_template(template: str, fields: dict[str, str], counters: dict) -> str:
     rendered = render_expr(template, fields, counters)
     if rendered:
@@ -1024,7 +1025,7 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]]) -> dict
     return fragments
 
 
-def strip_blocks(source: str, blocks: list[MarkerBlock]) -> str:
+def strip_marker_blocks(source: str, blocks: list[MarkerBlock]) -> str:
     parts = []
     cursor = 0
     for block in sorted(blocks, key=lambda item: item.start):
@@ -1037,33 +1038,26 @@ def strip_blocks(source: str, blocks: list[MarkerBlock]) -> str:
     return source.strip() + "\n"
 
 
-def ensure_syntax_hints_include(source: str) -> str:
-    if GENERATED_SYNTAX_HINTS_INCLUDE in source:
-        return source
-    if SYNTAX_HINTS_INCLUDE in source:
-        return source.replace(SYNTAX_HINTS_INCLUDE, GENERATED_SYNTAX_HINTS_INCLUDE)
-
-    pragma = "#pragma once"
-    if source.startswith(pragma):
-        return source.replace(pragma, f"{pragma}\n\n{GENERATED_SYNTAX_HINTS_INCLUDE}", 1)
-
-    return f"{GENERATED_SYNTAX_HINTS_INCLUDE}\n\n{source}"
-
-
-def write_generated_sources(shared_dir: Path, strip_map: dict[Path, list[MarkerBlock]], out_map: dict[str, Path]) -> None:
-    for tag, out_file in out_map.items():
-        output_root = out_file.parent
-        for file in sorted(shared_dir.rglob("*.h")):
-            rel = file.relative_to(shared_dir.parent)
-            out_path = output_root / rel
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out = strip_blocks(file.read_text(), strip_map.get(file, []))
-            out_path.write_text(ensure_syntax_hints_include(out))
-            print(f"Written {tag}: {out_path}")
+def write_generated_sources(
+    shared_dir: Path,
+    strip_map: dict[Path, list[MarkerBlock]],
+    output_root: Path,
+    source_suffixes: tuple[str, ...],
+) -> None:
+    for file in iter_source_files(shared_dir, source_suffixes):
+        rel = file.relative_to(shared_dir.parent)
+        out_path = output_root / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        source = file.read_text()
+        if file in strip_map:
+            out = strip_marker_blocks(source, strip_map.get(file, []))
+        else:
+            out = source
+        out_path.write_text(out)
+        print(f"Written: {out_path}")
 
 
-def write_syntax_hints(out_base: Path, pass_names: list[str]) -> Path:
-    out_path = out_base / "syntax_hints.h"
+def write_syntax_hints(out_path: Path, pass_names: list[str]) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pass_macros = "\n".join(f"#define ${name} struct" for name in sorted(pass_names))
     out_path.write_text(f"""#pragma once
@@ -1078,23 +1072,105 @@ def write_syntax_hints(out_base: Path, pass_names: list[str]) -> Path:
 
 """)
     print(f"Written syntax hints: {out_path}")
-    return out_path
 
 
-def main() -> None:
-    if len(sys.argv) < 5:
-        print("Usage: <this_file_name> <shared_dir> <gen_py_dir> <out_base_dir> tag=file ...")
-        sys.exit(1)
+def resolve_output_path(root: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return root / path
 
-    shared_dir = Path(sys.argv[1])
-    gen_dir = Path(sys.argv[2])
-    out_base = Path(sys.argv[3])
-    out_map = {tag: out_base / fname for tag, fname in (arg.split("=", 1) for arg in sys.argv[4:])}
 
-    gen_dir.mkdir(parents=True, exist_ok=True)
-    gen_stamp = gen_dir / "content.py"
+def parse_target_specs(target_specs: list[str], output_root: Path) -> dict[str, Path]:
+    targets: dict[str, Path] = {}
+    for spec in target_specs:
+        if "=" not in spec:
+            raise ValueError(f"Invalid target spec {spec!r}; expected <tag>=<path>")
+        tag, value = spec.split("=", 1)
+        tag = tag.strip()
+        value = value.strip()
+        if not tag or not value:
+            raise ValueError(f"Invalid target spec {spec!r}; expected <tag>=<path>")
+        if tag in targets:
+            raise ValueError(f"Duplicate target tag {tag!r}")
+        targets[tag] = resolve_output_path(output_root, value)
+    return targets
 
-    blocks, strip_map = discover_blocks(shared_dir)
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    if argv and not argv[0].startswith("-"):
+        if len(argv) < 4:
+            raise ValueError(
+                "Legacy usage: metacodegen.py <shared_dir> <gen_py_dir> <output_root> tag=path ..."
+            )
+        return argparse.Namespace(
+            shared_dir=Path(argv[0]),
+            output_root=Path(argv[2]),
+            shared_output_root=None,
+            syntax_hints=None,
+            no_syntax_hints=False,
+            source_suffixes=list(DEFAULT_SOURCE_SUFFIXES),
+            targets=argv[3:],
+        )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scan shared source files for $ markers, generate target-specific headers, "
+            "and emit stripped shared sources for integration into build outputs."
+        )
+    )
+    parser.add_argument("--shared-dir", required=True, type=Path, help="Source directory that contains shared files")
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        type=Path,
+        help="Base directory used to resolve relative output paths",
+    )
+    parser.add_argument(
+        "--shared-output-root",
+        type=Path,
+        default=None,
+        help="Optional extra directory for stripped shared sources in addition to per-target outputs",
+    )
+    parser.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        default=[],
+        help="Target output spec in the form <tag>=<stamp-or-output-path>",
+    )
+    parser.add_argument(
+        "--syntax-hints",
+        type=Path,
+        default=None,
+        help="Custom path for syntax_hints.h; defaults to <output-root>/syntax_hints.h",
+    )
+    parser.add_argument(
+        "--no-syntax-hints",
+        action="store_true",
+        help="Skip writing syntax_hints.h",
+    )
+    parser.add_argument(
+        "--source-suffix",
+        dest="source_suffixes",
+        action="append",
+        default=list(DEFAULT_SOURCE_SUFFIXES),
+        help="File suffix to scan and rewrite; can be provided multiple times",
+    )
+    args = parser.parse_args(argv)
+    if not args.targets:
+        parser.error("at least one --target <tag>=<path> is required")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    shared_dir = args.shared_dir
+    output_root = args.output_root
+    out_map = parse_target_specs(args.targets, output_root)
+    source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
+
+    blocks, strip_map = discover_blocks(shared_dir, source_suffixes)
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
     if not pass_blocks:
         raise ValueError(f"No $pass block found under {shared_dir}")
@@ -1105,7 +1181,7 @@ def main() -> None:
         if pass_def.name in pass_defs:
             raise ValueError(f"Duplicate $pass {pass_def.name}")
         pass_defs[pass_def.name] = pass_def
-        block.replacement = f'#include "{pass_def.name}.h"'
+        block.replacement = ""
 
     instances_by_pass = {name: [] for name in pass_defs}
 
@@ -1121,25 +1197,25 @@ def main() -> None:
         instances_by_pass[marker_name].append(parse_instance(block, pass_def))
 
     for tag, stamp_path in out_map.items():
-        output_root = stamp_path.parent
-        output_root.mkdir(parents=True, exist_ok=True)
+        target_root = stamp_path.parent
+        target_root.mkdir(parents=True, exist_ok=True)
         for name, pass_def in pass_defs.items():
-            stale_wrapper = output_root / f"{pass_def.name}.h"
-            if stale_wrapper.exists():
-                stale_wrapper.unlink()
             fragments = render_fragments(pass_def, instances_by_pass[name])
             for fragment_name, content in fragments.items():
-                out_path = output_root / f"{fragment_name}.h"
+                out_path = target_root / f"{fragment_name}.h"
                 out_path.write_text(content)
                 print(f"Written {tag}: {out_path}")
+        write_generated_sources(shared_dir, strip_map, target_root, source_suffixes)
         stamp_path.write_text("# Generated by codegen\n")
         print(f"Written {tag}: {stamp_path}")
 
-    write_generated_sources(shared_dir, strip_map, out_map)
-    write_syntax_hints(out_base, list(pass_defs))
-    gen_stamp.write_text("# Generated by codegen\n")
-    print(f"Written generator stamp: {gen_stamp}")
+    if args.shared_output_root is not None:
+        write_generated_sources(shared_dir, strip_map, args.shared_output_root, source_suffixes)
+    if not args.no_syntax_hints:
+        syntax_hints_path = args.syntax_hints or (output_root / "syntax_hints.h")
+        write_syntax_hints(syntax_hints_path, list(pass_defs))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

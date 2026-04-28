@@ -11,6 +11,8 @@ enum tile_material {
     soil,
 };
 
+#include "item.h"
+#include "tile.h"
 #include "shared/items.h"
 #include "shared/tiles.h"
 
