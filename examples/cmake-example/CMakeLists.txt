@@ -59,7 +59,7 @@ add_custom_command(
         "${PROJECT_SOURCE_DIR}/../../metacodegen.py"
         --shared-dir "${PROJECT_SOURCE_DIR}/src"
         --output-root "${PROJECT_BINARY_DIR}"
-        --generated-header-prefix g_
+        --generated-header-root g
         --target server=server/content.stamp
         --target client=client/content.stamp
     DEPENDS

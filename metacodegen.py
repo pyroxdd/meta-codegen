@@ -1235,6 +1235,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             output_root=Path(argv[2]),
             shared_output_root=None,
             generated_header_prefix="",
+            generated_header_root="",
             syntax_hints=None,
             no_syntax_hints=False,
             source_suffixes=list(DEFAULT_SOURCE_SUFFIXES),
@@ -1264,6 +1265,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--generated-header-prefix",
         default="",
         help="Optional prefix added to generated fragment header filenames such as prefab.h -> <prefix>prefab.h",
+    )
+    parser.add_argument(
+        "--generated-header-root",
+        default="",
+        help="Optional directory under each target where generated fragment headers are organized by pass, e.g. g/tile/textures.h",
     )
     parser.add_argument(
         "--target",
@@ -1332,7 +1338,11 @@ def main(argv: list[str] | None = None) -> int:
         for name, pass_def in pass_defs.items():
             fragments = render_fragments(pass_def, instances_by_pass[name])
             for fragment_name, content in fragments.items():
-                out_path = target_root / f"{args.generated_header_prefix}{fragment_name}.h"
+                if args.generated_header_root:
+                    out_path = target_root / args.generated_header_root / name / f"{args.generated_header_prefix}{fragment_name}.h"
+                else:
+                    out_path = target_root / f"{args.generated_header_prefix}{fragment_name}.h"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(content)
                 print(f"Written {tag}: {out_path}")
         write_generated_sources(shared_dir, strip_map, target_root, source_suffixes)
