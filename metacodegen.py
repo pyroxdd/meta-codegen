@@ -6,11 +6,9 @@ Usage can be found at start of main()
 """
 
 import argparse
-import importlib.util
 import re
 import sys
 import textwrap
-import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -382,30 +380,6 @@ def schema_starts_with_keyword(literal: str, keyword: str) -> bool:
     return not (stripped[len(keyword)].isalnum() or stripped[len(keyword)] == "_")
 
 
-def link_python_symbol(pass_file: Path, module_path: str, symbol: str | None = None):
-    path = Path(module_path)
-    if not path.is_absolute():
-        path = (pass_file.parent / path).resolve()
-    else:
-        path = path.resolve()
-
-    if not path.exists():
-        raise ValueError(f"Linked python module not found from {pass_file}: {module_path}")
-
-    module_name = f"_metacodegen_link_{path.stem}_{abs(hash(path))}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"Could not load linked python module: {path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if symbol is None:
-        return module
-    if not hasattr(module, symbol):
-        raise ValueError(f"Linked python module {path} has no symbol {symbol!r}")
-    return getattr(module, symbol)
-
-
 def run_init_python(source: str, file: Path) -> dict:
     source = textwrap.dedent(source).strip()
     safe_builtins = {
@@ -429,19 +403,21 @@ def run_init_python(source: str, file: Path) -> dict:
         "tuple": tuple,
         "zip": zip,
     }
-    scope = {
-        "__builtins__": safe_builtins,
-        "link": lambda module_path, symbol=None: link_python_symbol(file, module_path, symbol),
-    }
+    scope = {"__builtins__": safe_builtins}
+    import_paths = []
+    for candidate in (file.parent.resolve(), Path.cwd().resolve()):
+        if candidate not in import_paths:
+            import_paths.append(candidate)
+    previous_sys_path = list(sys.path)
+    for path in reversed(import_paths):
+        sys.path.insert(0, str(path))
     try:
         exec(source, scope, scope)
     except Exception as exc:
         raise ValueError(f"Invalid raw python in $pass block in {file}: {exc}") from exc
-    return {
-        key: value
-        for key, value in scope.items()
-        if not key.startswith("__") and not isinstance(value, types.ModuleType)
-    }
+    finally:
+        sys.path[:] = previous_sys_path
+    return {key: value for key, value in scope.items() if not key.startswith("__")}
 
 
 def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
