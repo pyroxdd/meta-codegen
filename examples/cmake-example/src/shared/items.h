@@ -15,9 +15,9 @@ $pass {
   "weight = "weight";"
   "};"
 } {
-  item_decls += "static const item "name";"
-  items += "inline constexpr item item::"name" = {"index"};"
-  item_weights += weight","
+  out.item_decls += "static const item "name";"
+  out.items += "inline constexpr item item::"name" = {"index"};"
+  out.item_weights += weight","
 };
 
 namespace items {

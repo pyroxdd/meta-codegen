@@ -13,7 +13,8 @@ The generator emits one shared build tree:
 - consumers include only the generated fragments and stripped shared files they need
 
 Pass authoring notes:
-- fragment outputs are inferred from `name += ...` lines in the instance block
+- top-level fragment outputs must use `out.name += ...` in the instance block
+- named passes must declare output params like `$pass mypass(header_a, header_b) { ... } { header_a += ... }`
 - you no longer need `my_fragment = []` declarations in the pass preamble
 - `index` is a built-in per-instance counter starting at `0`
 - branch choices can be captured with syntax like `side["server"|"client"]`

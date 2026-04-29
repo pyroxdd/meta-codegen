@@ -29,13 +29,13 @@ $pass {
   ["onhit = "onhit";"|]
   "};"
 } {
-  tile_decls += "static const tile "name";"
-  tiles += "inline constexpr tile tile::"name" = {"index"};"
-  textures += texture","
-  materials += material","
-  hits += "case tile::"name".index: {"
-  hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
-  hits += "} break;"
+  out.tile_decls += "static const tile "name";"
+  out.tiles += "inline constexpr tile tile::"name" = {"index"};"
+  out.textures += texture","
+  out.materials += material","
+  out.hits += "case tile::"name".index: {"
+  out.hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
+  out.hits += "} break;"
 };
 
 

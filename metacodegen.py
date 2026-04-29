@@ -627,6 +627,8 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     instance_ops = parse_instance_section(sections["instance"])
     is_helper = name is not None
     if is_helper:
+        if not output_params:
+            raise ValueError(f"$pass {name} must declare at least one output parameter; implicit return output is no longer supported")
         invalid_targets = sorted({
             op.target for op in instance_ops
             if op.kind == "emit" and op.target not in output_params
@@ -639,6 +641,26 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
                     continue
                 # arity checked later once helper defs are known
                 pass
+    else:
+        invalid_emit_targets = sorted({
+            op.target for op in instance_ops
+            if op.kind == "emit" and op.target is not None and not op.target.startswith("out.")
+        })
+        if invalid_emit_targets:
+            raise ValueError(
+                f"Top-level $pass in {file} must write to outputs using 'out.<name> += ...', found: {', '.join(invalid_emit_targets)}"
+            )
+        invalid_call_targets = sorted({
+            target
+            for op in instance_ops
+            if op.kind == "call" and op.output_targets is not None
+            for target in op.output_targets
+            if not target.startswith("out.")
+        })
+        if invalid_call_targets:
+            raise ValueError(
+                f"Top-level $pass in {file} must pass outputs as 'out.<name>' when calling named passes, found: {', '.join(invalid_call_targets)}"
+            )
     return PassDef(
         name=name,
         block_keyword=name or "__top_level__",
@@ -1002,17 +1024,15 @@ def resolve_output_sink(
     target: str,
     local_output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
-    allow_legacy_global: bool,
 ) -> list[str]:
     if target in local_output_bindings:
         return local_output_bindings[target]
     if target.startswith("out."):
         normalized = normalize_output_target(target)
         return global_accs.setdefault(normalized, [])
-    normalized = normalize_output_target(target)
-    if allow_legacy_global:
-        return global_accs.setdefault(normalized, [])
-    raise ValueError(f"Unknown output target {target!r}")
+    raise ValueError(
+        f"Unknown output target {target!r}; use a declared named-pass output parameter or an 'out.<name>' global output"
+    )
 
 
 def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
@@ -1357,24 +1377,6 @@ def format_cpp_like(source: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_helper_functions(
-    helper_defs: dict[str, PassDef],
-    outer_fields: dict[str, str],
-    outer_counters: dict,
-) -> dict[str, object]:
-    helper_functions: dict[str, object] = {}
-
-    for helper_name, helper_def in helper_defs.items():
-        if helper_def.output_params:
-            continue
-        def invoke(input_text, _helper_def=helper_def):
-            return render_helper_pass_legacy(_helper_def, str(input_text), outer_fields, outer_counters, helper_defs)
-
-        helper_functions[helper_name] = invoke
-
-    return helper_functions
-
-
 def execute_instance_ops(
     pass_def: PassDef,
     fields: dict[str, str],
@@ -1382,15 +1384,14 @@ def execute_instance_ops(
     helper_defs: dict[str, PassDef],
     local_output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
-    allow_legacy_global: bool,
 ) -> None:
-    helper_functions = build_helper_functions(helper_defs, fields, counters)
+    helper_functions: dict[str, object] = {}
     for op in pass_def.instance_ops:
         if op.kind == "emit":
             if op.target is None or op.template is None:
                 continue
             rendered = render_template(op.template, fields, counters, helper_functions)
-            sink = resolve_output_sink(op.target, local_output_bindings, global_accs, allow_legacy_global)
+            sink = resolve_output_sink(op.target, local_output_bindings, global_accs)
             sink.append(rendered)
             continue
 
@@ -1406,7 +1407,7 @@ def execute_instance_ops(
                 )
             input_text = render_template(op.input_expr, fields, counters, helper_functions)
             bound_outputs = {
-                param: resolve_output_sink(target, local_output_bindings, global_accs, allow_legacy_global)
+                param: resolve_output_sink(target, local_output_bindings, global_accs)
                 for param, target in zip(helper_def.output_params, op.output_targets)
             }
             execute_named_pass(helper_def, input_text, fields, counters, helper_defs, bound_outputs, global_accs)
@@ -1451,54 +1452,10 @@ def execute_named_pass(
         counters = copy.deepcopy(state)
         counters.update(outer_counters)
         counters["index"] = local_index
-        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs, allow_legacy_global=False)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs)
 
         pos = skip_c_whitespace(input_text, end)
         local_index += 1
-
-
-def render_helper_pass_legacy(
-    pass_def: PassDef,
-    input_text: str,
-    outer_fields: dict[str, str],
-    outer_counters: dict,
-    helper_defs: dict[str, PassDef],
-) -> str:
-    import copy
-
-    state = {}
-    for key, value in pass_def.init_vars.items():
-        if isinstance(value, list):
-            continue
-        if isinstance(value, (dict, set, tuple)):
-            state[key] = copy.deepcopy(value)
-        else:
-            state[key] = value
-
-    output_parts: list[str] = []
-    pos = skip_c_whitespace(input_text, 0)
-    local_index = 0
-
-    while pos < len(input_text):
-        matched = match_schema_nodes(input_text, pass_def.schema, 0, pos, outer_fields.copy(), allow_trailing=True)
-        if matched is None:
-            snippet = input_text[pos:pos + 40]
-            raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
-
-        end, fields = matched
-        if end <= pos:
-            raise ValueError(f"Helper pass {pass_def.name} made no progress")
-
-        counters = copy.deepcopy(state)
-        counters.update(outer_counters)
-        counters["index"] = local_index
-        local_output_bindings = {"return": output_parts}
-        execute_instance_ops(pass_def, fields, counters, helper_defs, local_output_bindings, {}, allow_legacy_global=False)
-
-        pos = skip_c_whitespace(input_text, end)
-        local_index += 1
-
-    return format_cpp_like("\n".join(output_parts))
 
 
 def render_fragments(pass_def: PassDef, instances: list[dict[str, str]], helper_defs: dict[str, PassDef]) -> dict[str, str]:
@@ -1520,7 +1477,7 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]], helper_
 
     for index, fields in enumerate(instances):
         counters["index"] = index
-        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs, allow_legacy_global=True)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs)
 
     fragments = {}
     for key, value in accs.items():
