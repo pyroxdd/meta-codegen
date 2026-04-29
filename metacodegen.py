@@ -317,12 +317,9 @@ def parse_legacy_schema_branch(
 
 def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) -> list[SchemaPart]:
     compact: list[SchemaPart] = []
-    previous_can_end_with_capture = False
 
     for part in parts:
         if part.kind == "branch":
-            if previous_can_end_with_capture and part.capture_name:
-                raise ValueError(f"$pass {pass_name} schema in {file} has adjacent captures without literal syntax between them")
             alternatives = [
                 compact_schema_parts(alternative, pass_name, file)
                 for alternative in part.alternatives or []
@@ -330,9 +327,6 @@ def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) ->
             if not any(alternatives):
                 continue
             compact.append(SchemaPart("branch", alternatives=alternatives, capture_name=part.capture_name))
-            previous_can_end_with_capture = bool(part.capture_name) or any(
-                schema_ends_with_capture(alternative) for alternative in alternatives
-            )
             continue
 
         if part.kind == "literal":
@@ -340,28 +334,11 @@ def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) ->
                 compact[-1].value += part.value
             else:
                 compact.append(SchemaPart("literal", part.value))
-            previous_can_end_with_capture = False
             continue
 
-        if previous_can_end_with_capture:
-            raise ValueError(f"$pass {pass_name} schema in {file} has adjacent captures without literal syntax between them")
         compact.append(part)
-        previous_can_end_with_capture = True
 
     return compact
-
-
-def schema_ends_with_capture(parts: list[SchemaPart]) -> bool:
-    for part in reversed(parts):
-        if part.kind == "literal" and part.value:
-            return False
-        if part.kind == "capture":
-            return True
-        if part.kind == "branch":
-            if part.capture_name:
-                return True
-            return any(schema_ends_with_capture(alternative) for alternative in part.alternatives or [])
-    return False
 
 
 def first_schema_literal(parts: list[SchemaPart]) -> str:
@@ -503,6 +480,51 @@ def parse_instance_statement(text: str, block_lines: list[str] | None = None) ->
 def parse_instance_section(instance_body: str) -> list[InstanceOp]:
     lines = instance_body.splitlines()
 
+    def parse_if_statement(line_text: str, line_index: int) -> tuple[InstanceOp, int]:
+        stripped = line_text.strip()
+        if_match = re.match(r'\s*if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s*(.*)$', line_text)
+        if if_match is None:
+            raise ValueError(f"Unsupported if statement: {stripped!r}")
+
+        field_name = if_match.group(1)
+        op = if_match.group(2)
+        cmp_value = if_match.group(3)
+        rest = if_match.group(4).strip()
+
+        if rest == "{":
+            true_ops, next_i = parse_ops(line_index + 1, stop_on_else=True)
+        elif rest:
+            true_ops = [parse_instance_statement(rest)]
+            next_i = line_index + 1
+        else:
+            raise ValueError(f"Unsupported if statement: {stripped!r}")
+
+        false_ops: list[InstanceOp] = []
+        if next_i < len(lines):
+            else_stripped = lines[next_i].strip()
+            else_match = re.match(r'^else\s*(.*)$', else_stripped)
+            if else_match:
+                else_rest = else_match.group(1).strip()
+                if else_rest == "{":
+                    false_ops, next_i = parse_ops(next_i + 1)
+                elif else_rest.startswith("if "):
+                    nested_if, next_i = parse_if_statement(else_rest, next_i)
+                    false_ops = [nested_if]
+                elif else_rest:
+                    false_ops = [parse_instance_statement(else_rest)]
+                    next_i += 1
+                else:
+                    raise ValueError(f"Unsupported else statement: {else_stripped!r}")
+
+        return InstanceOp(
+            kind="if",
+            condition_field=field_name,
+            condition_op=op,
+            condition_value=cmp_value,
+            true_ops=true_ops,
+            false_ops=false_ops,
+        ), next_i
+
     def parse_ops(start: int, stop_on_else: bool = False) -> tuple[list[InstanceOp], int]:
         ops: list[InstanceOp] = []
         i = start
@@ -517,43 +539,9 @@ def parse_instance_section(instance_body: str) -> list[InstanceOp]:
             if stop_on_else and (stripped == "else" or stripped.startswith("else ") or stripped.startswith("else{")):
                 return ops, i
 
-            if_match = re.match(r'\s*if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s*(.*)$', lines[i])
-            if if_match:
-                field_name = if_match.group(1)
-                op = if_match.group(2)
-                cmp_value = if_match.group(3)
-                rest = if_match.group(4).strip()
-
-                if rest == "{":
-                    true_ops, next_i = parse_ops(i + 1, stop_on_else=True)
-                elif rest:
-                    true_ops = [parse_instance_statement(rest)]
-                    next_i = i + 1
-                else:
-                    raise ValueError(f"Unsupported if statement: {stripped!r}")
-
-                false_ops: list[InstanceOp] = []
-                if next_i < len(lines):
-                    else_stripped = lines[next_i].strip()
-                    else_match = re.match(r'^else\s*(.*)$', else_stripped)
-                    if else_match:
-                        else_rest = else_match.group(1).strip()
-                        if else_rest == "{":
-                            false_ops, next_i = parse_ops(next_i + 1)
-                        elif else_rest:
-                            false_ops = [parse_instance_statement(else_rest)]
-                            next_i += 1
-                        else:
-                            raise ValueError(f"Unsupported else statement: {else_stripped!r}")
-
-                ops.append(InstanceOp(
-                    kind="if",
-                    condition_field=field_name,
-                    condition_op=op,
-                    condition_value=cmp_value,
-                    true_ops=true_ops,
-                    false_ops=false_ops,
-                ))
+            if re.match(r'\s*if\s+', lines[i]):
+                if_op, next_i = parse_if_statement(lines[i], i)
+                ops.append(if_op)
                 i = next_i
                 continue
 
