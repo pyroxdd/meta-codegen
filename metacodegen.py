@@ -46,6 +46,13 @@ class InstanceOp:
     helper_name: str | None = None
     input_expr: str | None = None
     output_targets: list[str] | None = None
+    alias_name: str | None = None
+    source_target: str | None = None
+    condition_field: str | None = None
+    condition_op: str | None = None
+    condition_value: str | None = None
+    true_ops: list["InstanceOp"] | None = None
+    false_ops: list["InstanceOp"] | None = None
 
 
 @dataclass
@@ -455,49 +462,141 @@ def run_init_python(source: str, file: Path) -> dict:
     return {key: value for key, value in scope.items() if not key.startswith("__")}
 
 
+def parse_instance_statement(text: str, block_lines: list[str] | None = None) -> InstanceOp:
+    decl_match = re.match(r'\s*var\s+([A-Za-z_]\w*)\s*$', text)
+    if decl_match:
+        return InstanceOp(kind="var", alias_name=decl_match.group(1))
+
+    assign_match = re.match(r'\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*$', text)
+    if assign_match:
+        return InstanceOp(
+            kind="assign",
+            alias_name=assign_match.group(1),
+            source_target=assign_match.group(2),
+        )
+
+    emit_match = re.match(r'\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\+=\s*(.*)', text)
+    if emit_match:
+        target = emit_match.group(1)
+        rest = emit_match.group(2).strip()
+        if rest:
+            return InstanceOp(kind="emit", target=target, template=rest)
+        if block_lines is None:
+            raise ValueError(f"Expected indented block after emit target {target!r}")
+        return InstanceOp(kind="emit", target=target, template="\n".join(block_lines))
+
+    call_match = re.match(r'\s*([A-Za-z_]\w*)\s*\[(.+)\]\s*\((.*)\)\s*$', text)
+    if call_match:
+        helper_name = call_match.group(1)
+        input_expr = call_match.group(2).strip()
+        output_targets = [part.strip() for part in split_top_level(call_match.group(3), ",") if part.strip()]
+        return InstanceOp(
+            kind="call",
+            helper_name=helper_name,
+            input_expr=input_expr,
+            output_targets=output_targets,
+        )
+
+    raise ValueError(f"Unsupported instance statement: {text.strip()!r}")
+
+
 def parse_instance_section(instance_body: str) -> list[InstanceOp]:
     lines = instance_body.splitlines()
-    ops = []
-    i = 0
 
-    while i < len(lines):
-        emit_match = re.match(r'\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\+=\s*(.*)', lines[i])
-        if emit_match:
-            target = emit_match.group(1)
-            rest = emit_match.group(2).strip()
+    def parse_ops(start: int, stop_on_else: bool = False) -> tuple[list[InstanceOp], int]:
+        ops: list[InstanceOp] = []
+        i = start
 
-            if rest:
-                ops.append(InstanceOp(kind="emit", target=target, template=rest))
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped:
                 i += 1
                 continue
+            if stripped == "}":
+                return ops, i + 1
+            if stop_on_else and (stripped == "else" or stripped.startswith("else ") or stripped.startswith("else{")):
+                return ops, i
 
-            block = []
-            i += 1
-            while i < len(lines) and lines[i].startswith(" "):
-                block.append(lines[i])
+            if_match = re.match(r'\s*if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s*(.*)$', lines[i])
+            if if_match:
+                field_name = if_match.group(1)
+                op = if_match.group(2)
+                cmp_value = if_match.group(3)
+                rest = if_match.group(4).strip()
+
+                if rest == "{":
+                    true_ops, next_i = parse_ops(i + 1, stop_on_else=True)
+                elif rest:
+                    true_ops = [parse_instance_statement(rest)]
+                    next_i = i + 1
+                else:
+                    raise ValueError(f"Unsupported if statement: {stripped!r}")
+
+                false_ops: list[InstanceOp] = []
+                if next_i < len(lines):
+                    else_stripped = lines[next_i].strip()
+                    else_match = re.match(r'^else\s*(.*)$', else_stripped)
+                    if else_match:
+                        else_rest = else_match.group(1).strip()
+                        if else_rest == "{":
+                            false_ops, next_i = parse_ops(next_i + 1)
+                        elif else_rest:
+                            false_ops = [parse_instance_statement(else_rest)]
+                            next_i += 1
+                        else:
+                            raise ValueError(f"Unsupported else statement: {else_stripped!r}")
+
+                ops.append(InstanceOp(
+                    kind="if",
+                    condition_field=field_name,
+                    condition_op=op,
+                    condition_value=cmp_value,
+                    true_ops=true_ops,
+                    false_ops=false_ops,
+                ))
+                i = next_i
+                continue
+
+            if stripped.startswith("else"):
+                raise ValueError("Unexpected else without matching if")
+
+            emit_match = re.match(r'\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\+=\s*(.*)', lines[i])
+            if emit_match and not emit_match.group(2).strip():
+                block = []
                 i += 1
-            ops.append(InstanceOp(kind="emit", target=target, template="\n".join(block)))
-            continue
+                while i < len(lines) and lines[i].startswith(" "):
+                    block.append(lines[i])
+                    i += 1
+                ops.append(parse_instance_statement(lines[i - len(block) - 1], block))
+                continue
 
-        call_match = re.match(r'\s*([A-Za-z_]\w*)\s*\[(.+)\]\s*\((.*)\)\s*$', lines[i])
-        if call_match:
-            helper_name = call_match.group(1)
-            input_expr = call_match.group(2).strip()
-            output_targets = [part.strip() for part in split_top_level(call_match.group(3), ",") if part.strip()]
-            ops.append(InstanceOp(
-                kind="call",
-                helper_name=helper_name,
-                input_expr=input_expr,
-                output_targets=output_targets,
-            ))
+            ops.append(parse_instance_statement(lines[i]))
             i += 1
-            continue
 
-        if lines[i].strip():
-            raise ValueError(f"Unsupported instance statement: {lines[i].strip()!r}")
-        i += 1
+        return ops, i
 
+    ops, end = parse_ops(0)
+    if end != len(lines):
+        trailing = next((line.strip() for line in lines[end:] if line.strip()), "")
+        if trailing:
+            raise ValueError(f"Unsupported trailing instance content: {trailing!r}")
     return ops
+
+
+def iter_instance_ops(ops: list[InstanceOp]):
+    for op in ops:
+        yield op
+        if op.kind == "if":
+            yield from iter_instance_ops(op.true_ops or [])
+            yield from iter_instance_ops(op.false_ops or [])
+
+
+def declared_instance_aliases(ops: list[InstanceOp]) -> set[str]:
+    return {
+        op.alias_name
+        for op in iter_instance_ops(ops)
+        if op.kind in {"var", "assign"} and op.alias_name is not None
+    }
 
 
 def parse_pass_header(header: str, file: Path) -> tuple[str | None, list[str]]:
@@ -625,17 +724,25 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         raw_python = sections.get("python", "")
 
     instance_ops = parse_instance_section(sections["instance"])
+    declared_aliases = declared_instance_aliases(instance_ops)
     is_helper = name is not None
     if is_helper:
         if not output_params:
             raise ValueError(f"$pass {name} must declare at least one output parameter; implicit return output is no longer supported")
         invalid_targets = sorted({
-            op.target for op in instance_ops
-            if op.kind == "emit" and op.target not in output_params
+            op.target for op in iter_instance_ops(instance_ops)
+            if op.kind == "emit" and op.target not in output_params and op.target not in declared_aliases
         })
         if invalid_targets:
             raise ValueError(f"$pass {name} may only write to declared outputs {output_params}, found: {', '.join(invalid_targets)}")
-        for op in instance_ops:
+        for op in iter_instance_ops(instance_ops):
+            if op.kind == "assign":
+                if op.source_target is None:
+                    continue
+                if op.source_target not in output_params and op.source_target not in declared_aliases:
+                    raise ValueError(
+                        f"$pass {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
+                    )
             if op.kind == "call":
                 if op.output_targets is None:
                     continue
@@ -643,23 +750,35 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
                 pass
     else:
         invalid_emit_targets = sorted({
-            op.target for op in instance_ops
-            if op.kind == "emit" and op.target is not None and not op.target.startswith("out.")
+            op.target for op in iter_instance_ops(instance_ops)
+            if op.kind == "emit" and op.target is not None and not target_is_allowed(op.target, declared_aliases)
         })
         if invalid_emit_targets:
             raise ValueError(
-                f"Top-level $pass in {file} must write to outputs using 'out.<name> += ...', found: {', '.join(invalid_emit_targets)}"
+                f"Top-level $pass in {file} must write to outputs using 'out.<name> += ...' or a declared variable, found: {', '.join(invalid_emit_targets)}"
+            )
+        invalid_assignments = []
+        for op in iter_instance_ops(instance_ops):
+            if op.kind != "assign":
+                continue
+            if op.source_target is None:
+                continue
+            if not target_is_allowed(op.source_target, declared_aliases):
+                invalid_assignments.append(op.source_target)
+        if invalid_assignments:
+            raise ValueError(
+                f"Top-level $pass in {file} may only bind variables to 'out.<name>' sinks or other declared variables, found: {', '.join(invalid_assignments)}"
             )
         invalid_call_targets = sorted({
             target
-            for op in instance_ops
+            for op in iter_instance_ops(instance_ops)
             if op.kind == "call" and op.output_targets is not None
             for target in op.output_targets
-            if not target.startswith("out.")
+            if not target_is_allowed(target, declared_aliases)
         })
         if invalid_call_targets:
             raise ValueError(
-                f"Top-level $pass in {file} must pass outputs as 'out.<name>' when calling named passes, found: {', '.join(invalid_call_targets)}"
+                f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling named passes, found: {', '.join(invalid_call_targets)}"
             )
     return PassDef(
         name=name,
@@ -669,8 +788,8 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         output_params=output_params,
         instance_targets=list(dict.fromkeys(
             normalize_output_target(op.target)
-            for op in instance_ops
-            if op.kind == "emit" and op.target is not None and (not is_helper)
+            for op in iter_instance_ops(instance_ops)
+            if op.kind == "emit" and op.target is not None and (not is_helper) and op.target not in declared_aliases
         )),
         instance_ops=instance_ops,
         is_helper=is_helper,
@@ -1018,6 +1137,10 @@ def default_pass_output_name(pass_def: PassDef, fallback: str) -> str:
 
 def normalize_output_target(target: str) -> str:
     return target[4:] if target.startswith("out.") else target
+
+
+def target_is_allowed(target: str, declared_aliases: set[str]) -> bool:
+    return target.startswith("out.") or target in declared_aliases
 
 
 def resolve_output_sink(
@@ -1387,6 +1510,15 @@ def execute_instance_ops(
 ) -> None:
     helper_functions: dict[str, object] = {}
     for op in pass_def.instance_ops:
+        if op.kind == "var":
+            continue
+
+        if op.kind == "assign":
+            if op.alias_name is None or op.source_target is None:
+                continue
+            local_output_bindings[op.alias_name] = resolve_output_sink(op.source_target, local_output_bindings, global_accs)
+            continue
+
         if op.kind == "emit":
             if op.target is None or op.template is None:
                 continue
@@ -1411,6 +1543,27 @@ def execute_instance_ops(
                 for param, target in zip(helper_def.output_params, op.output_targets)
             }
             execute_named_pass(helper_def, input_text, fields, counters, helper_defs, bound_outputs, global_accs)
+            continue
+
+        if op.kind == "if":
+            if op.condition_field is None or op.condition_op is None or op.condition_value is None:
+                continue
+            matches = fields.get(op.condition_field, "") == op.condition_value
+            if op.condition_op == "!=":
+                matches = not matches
+            branch_ops = op.true_ops if matches else op.false_ops
+            if branch_ops:
+                nested_pass = PassDef(
+                    name=pass_def.name,
+                    block_keyword=pass_def.block_keyword,
+                    schema=pass_def.schema,
+                    init_vars=pass_def.init_vars,
+                    output_params=pass_def.output_params,
+                    instance_targets=pass_def.instance_targets,
+                    instance_ops=branch_ops,
+                    is_helper=pass_def.is_helper,
+                )
+                execute_instance_ops(nested_pass, fields, counters, helper_defs, local_output_bindings, global_accs)
             continue
 
         raise ValueError(f"Unsupported instance op kind {op.kind!r}")
