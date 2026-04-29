@@ -16,6 +16,7 @@ Pass authoring notes:
 - fragment outputs are inferred from `name += ...` lines in `instance()`
 - you no longer need `my_fragment = []` declarations in the pass preamble
 - `index` is a built-in per-instance counter starting at `0`
+- branch choices can be captured with syntax like `side["server"|"client"]`
 
 ![Code Generation Example](assets/codegen_example.png)
 

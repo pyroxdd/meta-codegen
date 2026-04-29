@@ -41,6 +41,7 @@ class SchemaPart:
     kind: str
     value: str = ""
     alternatives: list[list["SchemaPart"]] | None = None
+    capture_name: str | None = None
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
@@ -178,8 +179,12 @@ def parse_raw_schema_parts(source: str, start: int, in_branch: bool) -> tuple[li
             if literal:
                 parts.append(SchemaPart("literal", "".join(literal)))
                 literal = []
-            parts.append(SchemaPart("capture", name))
             i = end + 1
+            if i < len(source) and source[i] == "[":
+                branch, i = parse_raw_schema_branch(source, i + 1, capture_name=name)
+                parts.append(branch)
+                continue
+            parts.append(SchemaPart("capture", name))
             continue
         literal.append(ch)
         i += 1
@@ -189,7 +194,7 @@ def parse_raw_schema_parts(source: str, start: int, in_branch: bool) -> tuple[li
     return parts, i
 
 
-def parse_raw_schema_branch(source: str, start: int) -> tuple[SchemaPart, int]:
+def parse_raw_schema_branch(source: str, start: int, capture_name: str | None = None) -> tuple[SchemaPart, int]:
     alternatives = []
     saw_separator = False
     i = start
@@ -206,7 +211,7 @@ def parse_raw_schema_branch(source: str, start: int) -> tuple[SchemaPart, int]:
         if source[i] == "]":
             if not saw_separator:
                 raise ValueError("Schema branch must contain '|'")
-            return SchemaPart("branch", alternatives=alternatives), i + 1
+            return SchemaPart("branch", alternatives=alternatives, capture_name=capture_name), i + 1
         raise ValueError(f"Invalid schema branch syntax near {source[i:i+20]!r}")
 
 
@@ -243,15 +248,26 @@ def parse_legacy_schema_parts(
             continue
         ident = re.match(r"[A-Za-z_]\w*", source[i:])
         if ident:
-            parts.append(SchemaPart("capture", ident.group(0)))
-            i += len(ident.group(0))
+            name = ident.group(0)
+            i += len(name)
+            if i < len(source) and source[i] == "[":
+                branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, capture_name=name)
+                parts.append(branch)
+                continue
+            parts.append(SchemaPart("capture", name))
             continue
         raise ValueError(f"Invalid schema syntax in $pass {pass_name} in {file}: {source[i:i+20]!r}")
 
     return parts, i
 
 
-def parse_legacy_schema_branch(source: str, start: int, pass_name: str, file: Path) -> tuple[SchemaPart, int]:
+def parse_legacy_schema_branch(
+    source: str,
+    start: int,
+    pass_name: str,
+    file: Path,
+    capture_name: str | None = None,
+) -> tuple[SchemaPart, int]:
     alternatives = []
     saw_separator = False
     i = start
@@ -268,7 +284,7 @@ def parse_legacy_schema_branch(source: str, start: int, pass_name: str, file: Pa
         if source[i] == "]":
             if not saw_separator:
                 raise ValueError(f"Schema branch in $pass {pass_name} in {file} must contain '|'")
-            return SchemaPart("branch", alternatives=alternatives), i + 1
+            return SchemaPart("branch", alternatives=alternatives, capture_name=capture_name), i + 1
         raise ValueError(f"Invalid schema branch in $pass {pass_name} in {file}: {source[i:i+20]!r}")
 
 
@@ -278,14 +294,18 @@ def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) ->
 
     for part in parts:
         if part.kind == "branch":
+            if previous_can_end_with_capture and part.capture_name:
+                raise ValueError(f"$pass {pass_name} schema in {file} has adjacent captures without literal syntax between them")
             alternatives = [
                 compact_schema_parts(alternative, pass_name, file)
                 for alternative in part.alternatives or []
             ]
             if not any(alternatives):
                 continue
-            compact.append(SchemaPart("branch", alternatives=alternatives))
-            previous_can_end_with_capture = any(schema_ends_with_capture(alternative) for alternative in alternatives)
+            compact.append(SchemaPart("branch", alternatives=alternatives, capture_name=part.capture_name))
+            previous_can_end_with_capture = bool(part.capture_name) or any(
+                schema_ends_with_capture(alternative) for alternative in alternatives
+            )
             continue
 
         if part.kind == "literal":
@@ -311,6 +331,8 @@ def schema_ends_with_capture(parts: list[SchemaPart]) -> bool:
         if part.kind == "capture":
             return True
         if part.kind == "branch":
+            if part.capture_name:
+                return True
             return any(schema_ends_with_capture(alternative) for alternative in part.alternatives or [])
     return False
 
@@ -628,37 +650,38 @@ def match_schema_nodes(
     index: int,
     pos: int,
     values: dict[str, str],
+    allow_trailing: bool = False,
 ) -> tuple[int, dict[str, str]] | None:
     if index >= len(schema):
-        if source[pos:].strip():
+        if not allow_trailing and source[pos:].strip():
             return None
-        return len(source), values
+        return pos, values
 
     part = schema[index]
     if part.kind == "literal":
         end = match_schema_literal(source, pos, part.value)
         if end is None:
             return None
-        return match_schema_nodes(source, schema, index + 1, end, values)
+        return match_schema_nodes(source, schema, index + 1, end, values, allow_trailing)
 
     if part.kind == "branch":
         for alternative in part.alternatives or []:
-            matched = match_schema_nodes(source, alternative + schema[index + 1:], 0, pos, values.copy())
+            matched_alternative = match_schema_nodes(source, alternative, 0, pos, values.copy(), allow_trailing=True)
+            if matched_alternative is None:
+                continue
+            alternative_end, alternative_values = matched_alternative
+            if part.capture_name:
+                alternative_values[part.capture_name] = source[pos:alternative_end].strip()
+            matched = match_schema_nodes(source, schema, index + 1, alternative_end, alternative_values, allow_trailing)
             if matched is not None:
                 return matched
         return None
-
-    if index == len(schema) - 1:
-        captured = source[pos:].strip()
-        next_values = values.copy()
-        next_values[part.value] = captured
-        return len(source), next_values
 
     for capture_end in iter_capture_end_positions(source, pos):
         captured = source[pos:capture_end].strip()
         next_values = values.copy()
         next_values[part.value] = captured
-        matched = match_schema_nodes(source, schema, index + 1, capture_end, next_values)
+        matched = match_schema_nodes(source, schema, index + 1, capture_end, next_values, allow_trailing)
         if matched is not None:
             return matched
 
