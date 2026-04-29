@@ -11,17 +11,13 @@ $item stone {
 };
 
 $pass {
-  schema() {
-    "item "name" {"
-    "weight = "weight";"
-    "};"
-  }
-
-  instance() {
-    item_decls += "static const item "name";"
-    items += "inline constexpr item item::"name" = {"index"};"
-    item_weights += weight","
-  }
+  "item "name" {"
+  "weight = "weight";"
+  "};"
+} {
+  item_decls += "static const item "name";"
+  items += "inline constexpr item item::"name" = {"index"};"
+  item_weights += weight","
 };
 
 namespace items {

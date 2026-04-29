@@ -22,24 +22,20 @@ $tile dirt {
 #include <iostream>
 
 $pass {
-  schema() {
-    "tile "name" {"
-    "texture = "texture";"
-    "durability = "durability";"
-    ["material = "material";"|"surface = "material";"|"kind = "material";"]
-    ["onhit = "onhit";"|]
-    "};"
-  }
-
-  instance() {
-    tile_decls += "static const tile "name";"
-    tiles += "inline constexpr tile tile::"name" = {"index"};"
-    textures += texture","
-    materials += material","
-    hits += "case tile::"name".index: {"
-    hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
-    hits += "} break;"
-  }
+  "tile "name" {"
+  "texture = "texture";"
+  "durability = "durability";"
+  ["material = "material";"|"surface = "material";"|"kind = "material";"]
+  ["onhit = "onhit";"|]
+  "};"
+} {
+  tile_decls += "static const tile "name";"
+  tiles += "inline constexpr tile tile::"name" = {"index"};"
+  textures += texture","
+  materials += material","
+  hits += "case tile::"name".index: {"
+  hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
+  hits += "} break;"
 };
 
 

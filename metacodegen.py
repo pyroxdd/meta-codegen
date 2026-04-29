@@ -32,9 +32,20 @@ class PassDef:
     block_keyword: str
     schema: list["SchemaPart"]
     init_vars: dict
+    output_params: list[str]
     instance_targets: list[str]
-    instance_ops: list[tuple[str, str]]
+    instance_ops: list["InstanceOp"]
     is_helper: bool = False
+
+
+@dataclass
+class InstanceOp:
+    kind: str
+    target: str | None = None
+    template: str | None = None
+    helper_name: str | None = None
+    input_expr: str | None = None
+    output_targets: list[str] | None = None
 
 
 @dataclass
@@ -46,8 +57,16 @@ class SchemaPart:
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
+    legacy_section_match = re.search(r'^[ \t]*(schema|instance)\s*\(\s*\)', source, re.MULTILINE)
+    if legacy_section_match is not None:
+        section_name = legacy_section_match.group(1)
+        raise ValueError(
+            f"Deprecated {section_name}() section syntax is no longer supported; "
+            f"use `{section_name} {{ ... }}` or the compact `$pass {{ schema }} {{ instance }}` form instead"
+        )
+
     section_re = re.compile(
-        r'^[ \t]*(pass|schema\s*\(\s*\)|schema|init\s*\(\s*\)|init|instance\s*\(\s*\)|instance)',
+        r'^[ \t]*(pass|schema|init\s*\(\s*\)|init|instance)',
         re.MULTILINE,
     )
 
@@ -64,7 +83,7 @@ def parse_pass_file(source: str) -> dict[str, str]:
 
         key = re.match(r'\w+', name).group(0)
         if key == "pass":
-            body = re.sub(r'^[ \t]*pass\s+\w+[ \t]*(?:\{[ \t]*\n?)?', '', body, count=1)
+            body = re.sub(r'^[ \t]*pass(?:[ \t]+\w+(?:\([^)]*\))?)?[ \t]*(?:\{[ \t]*\n?)?', '', body, count=1)
             raw_init = textwrap.dedent(body).strip()
             if raw_init:
                 sections["python"] = raw_init
@@ -436,40 +455,66 @@ def run_init_python(source: str, file: Path) -> dict:
     return {key: value for key, value in scope.items() if not key.startswith("__")}
 
 
-def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
+def parse_instance_section(instance_body: str) -> list[InstanceOp]:
     lines = instance_body.splitlines()
     ops = []
     i = 0
 
     while i < len(lines):
-        m = re.match(r'\s*(\w+)\s*\+=\s*(.*)', lines[i])
-        if not m:
-            i += 1
-            continue
+        emit_match = re.match(r'\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\+=\s*(.*)', lines[i])
+        if emit_match:
+            target = emit_match.group(1)
+            rest = emit_match.group(2).strip()
 
-        var = m.group(1)
-        rest = m.group(2).strip()
+            if rest:
+                ops.append(InstanceOp(kind="emit", target=target, template=rest))
+                i += 1
+                continue
 
-        if rest:
-            ops.append((var, rest))
-            i += 1
-        else:
             block = []
             i += 1
             while i < len(lines) and lines[i].startswith(" "):
                 block.append(lines[i])
                 i += 1
-            ops.append((var, "\n".join(block)))
+            ops.append(InstanceOp(kind="emit", target=target, template="\n".join(block)))
+            continue
+
+        call_match = re.match(r'\s*([A-Za-z_]\w*)\s*\[(.+)\]\s*\((.*)\)\s*$', lines[i])
+        if call_match:
+            helper_name = call_match.group(1)
+            input_expr = call_match.group(2).strip()
+            output_targets = [part.strip() for part in split_top_level(call_match.group(3), ",") if part.strip()]
+            ops.append(InstanceOp(
+                kind="call",
+                helper_name=helper_name,
+                input_expr=input_expr,
+                output_targets=output_targets,
+            ))
+            i += 1
+            continue
+
+        if lines[i].strip():
+            raise ValueError(f"Unsupported instance statement: {lines[i].strip()!r}")
+        i += 1
 
     return ops
 
 
+def parse_pass_header(header: str, file: Path) -> tuple[str | None, list[str]]:
+    m = re.match(r"pass(?:[ \t]+(\w+)(?:\(([^)]*)\))?)?\s*\{?\s*;?\s*$", header)
+    if not m:
+        raise ValueError(f"Expected $pass or $pass <name>(...) in {file}")
+    name = m.group(1)
+    output_params = []
+    if m.group(2):
+        output_params = [part.strip() for part in m.group(2).split(",") if part.strip()]
+    return name, output_params
+
+
 def pass_name(pass_text: str, file: Path) -> str | None:
     first_line = pass_text.lstrip().splitlines()[0].strip()
-    m = re.match(r"pass(?:\s+(\w+))?\s*\{?\s*;?\s*$", first_line)
-    if not m:
-        raise ValueError(f"Expected $pass or $pass <name> in {file}")
-    return m.group(1)
+    name, _ = parse_pass_header(first_line, file)
+    return name
 
 
 def unwrap_pass_block(pass_text: str) -> str:
@@ -481,13 +526,13 @@ def unwrap_pass_block(pass_text: str) -> str:
     return "\n".join(lines)
 
 
-def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str | None, str, str, str]:
+def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str | None, str, str]:
     stripped = pass_text.strip()
-    header_match = re.match(r"pass(?:\s+(\w+))?\s*\{", stripped)
+    header_match = re.match(r"pass(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{", stripped)
     if header_match is None:
         raise ValueError(f"Expected compact pass syntax in {file}")
 
-    name = header_match.group(1)
+    name, _ = parse_pass_header(stripped[:header_match.end() - 1].strip(), file)
     schema_open = stripped.find("{", header_match.start(), header_match.end())
     schema_close = matching_brace(stripped, schema_open)
     if schema_close is None:
@@ -506,18 +551,72 @@ def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str | None,
     if trailing not in ("", ";"):
         raise ValueError(f"Unexpected trailing pass syntax in {file}: {trailing!r}")
 
-    return name, schema_body, instance_body, ""
+    return name, schema_body, instance_body
+
+
+def normalize_compact_python(python_text: str) -> str:
+    lines = python_text.splitlines()
+    if not lines:
+        return ""
+
+    normalized = [lines[0].lstrip()]
+    indents = [
+        len(line) - len(line.lstrip())
+        for line in lines[1:]
+        if line.strip()
+    ]
+    trim = min(indents) if indents else 0
+    for line in lines[1:]:
+        if trim and len(line) >= trim:
+            normalized.append(line[trim:])
+        else:
+            normalized.append(line)
+    return "\n".join(normalized).strip()
+
+
+def split_compact_schema_block(block_body: str, pass_name: str | None, file: Path) -> tuple[str, str]:
+    lines = block_body.splitlines()
+    if not lines:
+        raise ValueError(f"Compact pass in {file} has an empty schema block")
+
+    candidates = []
+    for split_index in range(len(lines) + 1):
+        python_text = "\n".join(lines[:split_index]).strip()
+        schema_text = "\n".join(lines[split_index:]).strip()
+        if not schema_text:
+            continue
+
+        try:
+            parse_schema_template(schema_text, pass_name, file)
+        except ValueError:
+            continue
+
+        if python_text:
+            try:
+                compile(normalize_compact_python(python_text), str(file), "exec")
+            except SyntaxError:
+                continue
+
+        candidates.append((normalize_compact_python(python_text), schema_text))
+
+    if not candidates:
+        raise ValueError(f"Compact pass in {file} does not contain a valid schema block")
+
+    return candidates[-1]
 
 
 def compile_pass(pass_text: str, file: Path) -> PassDef:
     stripped_pass = pass_text.strip()
-    compact_match = re.match(r"pass(?:\s+\w+)?\s*\{", stripped_pass)
+    compact_match = re.match(r"pass(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{", stripped_pass)
     if compact_match is not None and "schema" not in stripped_pass and "instance" not in stripped_pass:
-        name, schema_body, instance_body, raw_python = parse_compact_pass_sections(stripped_pass, file)
-        sections = {"python": "", "schema": schema_body, "instance": instance_body}
+        name, first_block_body, instance_body = parse_compact_pass_sections(stripped_pass, file)
+        output_params = parse_pass_header(stripped_pass[:compact_match.end() - 1].strip(), file)[1]
+        raw_python, schema_body = split_compact_schema_block(first_block_body, name, file)
+        sections = {"python": raw_python, "schema": schema_body, "instance": instance_body}
     else:
         pass_text = unwrap_pass_block(pass_text)
-        name = pass_name(pass_text, file)
+        first_line = pass_text.lstrip().splitlines()[0].strip()
+        name, output_params = parse_pass_header(first_line, file)
         sections = parse_pass_file(pass_text)
         missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
         if missing:
@@ -528,15 +627,29 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     instance_ops = parse_instance_section(sections["instance"])
     is_helper = name is not None
     if is_helper:
-        invalid_targets = sorted({target for target, _ in instance_ops if target != "return"})
+        invalid_targets = sorted({
+            op.target for op in instance_ops
+            if op.kind == "emit" and op.target not in output_params
+        })
         if invalid_targets:
-            raise ValueError(f"$pass {name} may only write to return, found: {', '.join(invalid_targets)}")
+            raise ValueError(f"$pass {name} may only write to declared outputs {output_params}, found: {', '.join(invalid_targets)}")
+        for op in instance_ops:
+            if op.kind == "call":
+                if op.output_targets is None:
+                    continue
+                # arity checked later once helper defs are known
+                pass
     return PassDef(
         name=name,
         block_keyword=name or "__top_level__",
         schema=parse_schema_template(sections["schema"], name, file),
         init_vars=run_init_python(raw_python, file),
-        instance_targets=list(dict.fromkeys(var for var, _ in instance_ops)),
+        output_params=output_params,
+        instance_targets=list(dict.fromkeys(
+            normalize_output_target(op.target)
+            for op in instance_ops
+            if op.kind == "emit" and op.target is not None and (not is_helper)
+        )),
         instance_ops=instance_ops,
         is_helper=is_helper,
     )
@@ -861,13 +974,45 @@ def render_value(expr: str, fields: dict[str, str], counters: dict, helper_funct
 def default_pass_output_name(pass_def: PassDef, fallback: str) -> str:
     if pass_def.name:
         return pass_def.name
+    if pass_def.instance_targets:
+        tokenized = [target.split("_") for target in pass_def.instance_targets]
+        prefix: list[str] = []
+        for parts in zip(*tokenized):
+            if len(set(parts)) != 1:
+                break
+            prefix.append(parts[0])
+        if prefix:
+            return "_".join(prefix)
     literal = first_schema_literal(pass_def.schema).strip()
     if literal:
-        keyword = literal.split()[0]
-        keyword = re.sub(r"[^A-Za-z0-9_]+", "_", keyword)
+        keyword = re.sub(r"<[^>]*>", " ", literal)
+        keyword = re.sub(r'["\'{}\[\]();,]+', " ", keyword)
+        keyword = re.sub(r"\s+", "_", keyword.strip())
+        keyword = keyword.strip("_")
         if keyword:
             return keyword
     return fallback.replace(":", "_")
+
+
+def normalize_output_target(target: str) -> str:
+    return target[4:] if target.startswith("out.") else target
+
+
+def resolve_output_sink(
+    target: str,
+    local_output_bindings: dict[str, list[str]],
+    global_accs: dict[str, list[str]],
+    allow_legacy_global: bool,
+) -> list[str]:
+    if target in local_output_bindings:
+        return local_output_bindings[target]
+    if target.startswith("out."):
+        normalized = normalize_output_target(target)
+        return global_accs.setdefault(normalized, [])
+    normalized = normalize_output_target(target)
+    if allow_legacy_global:
+        return global_accs.setdefault(normalized, [])
+    raise ValueError(f"Unknown output target {target!r}")
 
 
 def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
@@ -1220,15 +1365,99 @@ def build_helper_functions(
     helper_functions: dict[str, object] = {}
 
     for helper_name, helper_def in helper_defs.items():
+        if helper_def.output_params:
+            continue
         def invoke(input_text, _helper_def=helper_def):
-            return render_helper_pass(_helper_def, str(input_text), outer_fields, outer_counters, helper_defs)
+            return render_helper_pass_legacy(_helper_def, str(input_text), outer_fields, outer_counters, helper_defs)
 
         helper_functions[helper_name] = invoke
 
     return helper_functions
 
 
-def render_helper_pass(
+def execute_instance_ops(
+    pass_def: PassDef,
+    fields: dict[str, str],
+    counters: dict,
+    helper_defs: dict[str, PassDef],
+    local_output_bindings: dict[str, list[str]],
+    global_accs: dict[str, list[str]],
+    allow_legacy_global: bool,
+) -> None:
+    helper_functions = build_helper_functions(helper_defs, fields, counters)
+    for op in pass_def.instance_ops:
+        if op.kind == "emit":
+            if op.target is None or op.template is None:
+                continue
+            rendered = render_template(op.template, fields, counters, helper_functions)
+            sink = resolve_output_sink(op.target, local_output_bindings, global_accs, allow_legacy_global)
+            sink.append(rendered)
+            continue
+
+        if op.kind == "call":
+            if op.helper_name is None or op.input_expr is None or op.output_targets is None:
+                continue
+            helper_def = helper_defs.get(op.helper_name)
+            if helper_def is None:
+                raise ValueError(f"Unknown helper pass {op.helper_name!r}")
+            if len(op.output_targets) != len(helper_def.output_params):
+                raise ValueError(
+                    f"Helper pass {op.helper_name} expects {len(helper_def.output_params)} outputs, got {len(op.output_targets)}"
+                )
+            input_text = render_template(op.input_expr, fields, counters, helper_functions)
+            bound_outputs = {
+                param: resolve_output_sink(target, local_output_bindings, global_accs, allow_legacy_global)
+                for param, target in zip(helper_def.output_params, op.output_targets)
+            }
+            execute_named_pass(helper_def, input_text, fields, counters, helper_defs, bound_outputs, global_accs)
+            continue
+
+        raise ValueError(f"Unsupported instance op kind {op.kind!r}")
+
+
+def execute_named_pass(
+    pass_def: PassDef,
+    input_text: str,
+    outer_fields: dict[str, str],
+    outer_counters: dict,
+    helper_defs: dict[str, PassDef],
+    output_bindings: dict[str, list[str]],
+    global_accs: dict[str, list[str]],
+) -> None:
+    import copy
+
+    state = {}
+    for key, value in pass_def.init_vars.items():
+        if isinstance(value, list):
+            continue
+        if isinstance(value, (dict, set, tuple)):
+            state[key] = copy.deepcopy(value)
+        else:
+            state[key] = value
+
+    pos = skip_c_whitespace(input_text, 0)
+    local_index = 0
+
+    while pos < len(input_text):
+        matched = match_schema_nodes(input_text, pass_def.schema, 0, pos, outer_fields.copy(), allow_trailing=True)
+        if matched is None:
+            snippet = input_text[pos:pos + 40]
+            raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
+
+        end, fields = matched
+        if end <= pos:
+            raise ValueError(f"Helper pass {pass_def.name} made no progress")
+
+        counters = copy.deepcopy(state)
+        counters.update(outer_counters)
+        counters["index"] = local_index
+        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs, allow_legacy_global=False)
+
+        pos = skip_c_whitespace(input_text, end)
+        local_index += 1
+
+
+def render_helper_pass_legacy(
     pass_def: PassDef,
     input_text: str,
     outer_fields: dict[str, str],
@@ -1263,11 +1492,8 @@ def render_helper_pass(
         counters = copy.deepcopy(state)
         counters.update(outer_counters)
         counters["index"] = local_index
-        helper_functions = build_helper_functions(helper_defs, fields, counters)
-
-        for var, tmpl in pass_def.instance_ops:
-            rendered = render_template(tmpl, fields, counters, helper_functions)
-            output_parts.append(rendered)
+        local_output_bindings = {"return": output_parts}
+        execute_instance_ops(pass_def, fields, counters, helper_defs, local_output_bindings, {}, allow_legacy_global=False)
 
         pos = skip_c_whitespace(input_text, end)
         local_index += 1
@@ -1294,10 +1520,7 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]], helper_
 
     for index, fields in enumerate(instances):
         counters["index"] = index
-        helper_functions = build_helper_functions(helper_defs, fields, counters)
-        for var, tmpl in pass_def.instance_ops:
-            rendered = render_template(tmpl, fields, counters, helper_functions)
-            accs[var].append(rendered)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs, allow_legacy_global=True)
 
     fragments = {}
     for key, value in accs.items():
@@ -1347,8 +1570,6 @@ def write_syntax_hints(out_path: Path, pass_names: list[str]) -> None:
 // lines look C++-ish to editors while generated files strip them out.
 #define $pass struct
 {pass_macros}
-#define schema() void schema()
-#define instance() void instance()
 
 """)
     print(f"Written syntax hints: {out_path}")
