@@ -28,12 +28,13 @@ class MarkerBlock:
 
 @dataclass
 class PassDef:
-    name: str
+    name: str | None
     block_keyword: str
     schema: list["SchemaPart"]
     init_vars: dict
     instance_targets: list[str]
     instance_ops: list[tuple[str, str]]
+    is_helper: bool = False
 
 
 @dataclass
@@ -463,11 +464,11 @@ def parse_instance_section(instance_body: str) -> list[tuple[str, str]]:
     return ops
 
 
-def pass_name(pass_text: str, file: Path) -> str:
+def pass_name(pass_text: str, file: Path) -> str | None:
     first_line = pass_text.lstrip().splitlines()[0].strip()
-    m = re.match(r"pass\s+(\w+)\s*\{?\s*;?\s*$", first_line)
+    m = re.match(r"pass(?:\s+(\w+))?\s*\{?\s*;?\s*$", first_line)
     if not m:
-        raise ValueError(f"Expected $pass <name> in {file}")
+        raise ValueError(f"Expected $pass or $pass <name> in {file}")
     return m.group(1)
 
 
@@ -480,22 +481,64 @@ def unwrap_pass_block(pass_text: str) -> str:
     return "\n".join(lines)
 
 
+def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str | None, str, str, str]:
+    stripped = pass_text.strip()
+    header_match = re.match(r"pass(?:\s+(\w+))?\s*\{", stripped)
+    if header_match is None:
+        raise ValueError(f"Expected compact pass syntax in {file}")
+
+    name = header_match.group(1)
+    schema_open = stripped.find("{", header_match.start(), header_match.end())
+    schema_close = matching_brace(stripped, schema_open)
+    if schema_close is None:
+        raise ValueError(f"Compact pass in {file} has an unterminated schema block")
+    schema_body = stripped[schema_open + 1:schema_close].strip()
+
+    instance_open = skip_c_whitespace(stripped, schema_close + 1)
+    if instance_open >= len(stripped) or stripped[instance_open] != "{":
+        raise ValueError(f"Compact pass in {file} is missing instance block")
+    instance_close = matching_brace(stripped, instance_open)
+    if instance_close is None:
+        raise ValueError(f"Compact pass in {file} has an unterminated instance block")
+    instance_body = stripped[instance_open + 1:instance_close].strip()
+
+    trailing = stripped[instance_close + 1:].strip()
+    if trailing not in ("", ";"):
+        raise ValueError(f"Unexpected trailing pass syntax in {file}: {trailing!r}")
+
+    return name, schema_body, instance_body, ""
+
+
 def compile_pass(pass_text: str, file: Path) -> PassDef:
-    pass_text = unwrap_pass_block(pass_text)
-    name = pass_name(pass_text, file)
-    sections = parse_pass_file(pass_text)
-    missing = [name for name in ("schema", "instance") if name not in sections]
-    if missing:
-        raise ValueError(f"$pass {name} is missing section(s): {', '.join(missing)}")
+    stripped_pass = pass_text.strip()
+    compact_match = re.match(r"pass(?:\s+\w+)?\s*\{", stripped_pass)
+    if compact_match is not None and "schema" not in stripped_pass and "instance" not in stripped_pass:
+        name, schema_body, instance_body, raw_python = parse_compact_pass_sections(stripped_pass, file)
+        sections = {"python": "", "schema": schema_body, "instance": instance_body}
+    else:
+        pass_text = unwrap_pass_block(pass_text)
+        name = pass_name(pass_text, file)
+        sections = parse_pass_file(pass_text)
+        missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
+        if missing:
+            display_name = name or "<top-level>"
+            raise ValueError(f"$pass {display_name} is missing section(s): {', '.join(missing)}")
+        raw_python = sections.get("python", "")
 
     instance_ops = parse_instance_section(sections["instance"])
+    is_helper = name is not None
+    if is_helper:
+        invalid_targets = sorted({target for target, _ in instance_ops if target != "return"})
+        if invalid_targets:
+            raise ValueError(f"$pass {name} may only write to return, found: {', '.join(invalid_targets)}")
     return PassDef(
         name=name,
-        block_keyword=name,
+        block_keyword=name or "__top_level__",
         schema=parse_schema_template(sections["schema"], name, file),
-        init_vars=run_init_python(sections.get("python", ""), file),
+        init_vars=run_init_python(raw_python, file),
         instance_targets=list(dict.fromkeys(var for var, _ in instance_ops)),
         instance_ops=instance_ops,
+        is_helper=is_helper,
     )
 
 
@@ -801,7 +844,7 @@ def iter_capture_end_positions(source: str, start: int):
             yield i
 
 
-def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
+def render_value(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str:
     expr = expr.strip()
     if len(expr) >= 2 and expr[0] in "\"'" and expr[-1] == expr[0]:
         try:
@@ -815,7 +858,19 @@ def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
     return ""
 
 
-def render_python_expr(expr: str, fields: dict[str, str], counters: dict) -> str | None:
+def default_pass_output_name(pass_def: PassDef, fallback: str) -> str:
+    if pass_def.name:
+        return pass_def.name
+    literal = first_schema_literal(pass_def.schema).strip()
+    if literal:
+        keyword = literal.split()[0]
+        keyword = re.sub(r"[^A-Za-z0-9_]+", "_", keyword)
+        if keyword:
+            return keyword
+    return fallback.replace(":", "_")
+
+
+def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
     def post_inc(name: str):
         value = counters.get(name, 0)
         counters[name] = value + 1
@@ -825,6 +880,7 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict) -> str
     scope = {}
     scope.update(counters)
     scope.update(fields)
+    scope.update(helper_functions)
     scope["__post_inc__"] = post_inc
     try:
         value = eval(translated, {"__builtins__": {}}, scope)
@@ -835,13 +891,13 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict) -> str
     return str(value)
 
 
-def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
+def render_expr(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str:
     expr = expr.strip()
 
     if expr.startswith("{"):
         end = matching_brace(expr, 0)
         if end == len(expr) - 1:
-            return render_block(expr[1:end], fields, counters)
+            return render_block(expr[1:end], fields, counters, helper_functions)
         return ""
 
     if expr.endswith("++"):
@@ -850,17 +906,17 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
         counters[var] = val + 1
         return str(val)
 
-    concat = render_implicit_concat(expr, fields, counters)
+    concat = render_implicit_concat(expr, fields, counters, helper_functions)
     if concat is not None:
         return concat
 
-    python_value = render_python_expr(expr, fields, counters)
+    python_value = render_python_expr(expr, fields, counters, helper_functions)
     if python_value is not None:
         return python_value
 
     parts = split_top_level(expr, "+")
     if len(parts) > 1:
-        values = [render_concat_atom(part, fields, counters) for part in parts]
+        values = [render_concat_atom(part, fields, counters, helper_functions) for part in parts]
         if any(value is None for value in values):
             return ""
         return "".join(values)
@@ -871,10 +927,10 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict) -> str:
     if expr in counters:
         return str(counters[expr])
 
-    return render_value(expr, fields, counters)
+    return render_value(expr, fields, counters, helper_functions)
 
 
-def render_block(body: str, fields: dict[str, str], counters: dict) -> str:
+def render_block(body: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str:
     body = body.strip()
     condition = parse_prefix_condition(body)
     if condition is not None:
@@ -882,7 +938,7 @@ def render_block(body: str, fields: dict[str, str], counters: dict) -> str:
         cond = fields.get(f, "") == cmp
         if op == "!=":
             cond = not cond
-        return render_block(true_body if cond else false_body, fields, counters)
+        return render_block(true_body if cond else false_body, fields, counters, helper_functions)
 
     if not body.startswith("return"):
         raise ValueError(f"Expected return statement in expression block: {body!r}")
@@ -896,8 +952,8 @@ def render_block(body: str, fields: dict[str, str], counters: dict) -> str:
         cond = fields.get(f, "") == cmp
         if op == "!=":
             cond = not cond
-        return render_expr(true_expr if cond else false_expr, fields, counters)
-    return render_expr(expr, fields, counters)
+        return render_expr(true_expr if cond else false_expr, fields, counters, helper_functions)
+    return render_expr(expr, fields, counters, helper_functions)
 
 
 def parse_ternary(expr: str) -> tuple[str, str, str, str, str] | None:
@@ -1014,7 +1070,7 @@ def find_top_level(expr: str, needle: str, start: int = 0) -> int | None:
     return None
 
 
-def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict) -> str | None:
+def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
     pieces = []
     i = 0
     saw_token = False
@@ -1060,7 +1116,7 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict) ->
         if i + len(token) + 1 < len(expr) and expr[i + len(token):i + len(token) + 2] == "++":
             token += "++"
         if token.endswith("++"):
-            pieces.append(render_expr(token, fields, counters))
+            pieces.append(render_expr(token, fields, counters, helper_functions))
         else:
             value = render_variable(token, fields, counters)
             if value is None:
@@ -1085,16 +1141,16 @@ def render_variable(token: str, fields: dict[str, str], counters: dict) -> str |
     return None
 
 
-def render_concat_atom(expr: str, fields: dict[str, str], counters: dict) -> str | None:
+def render_concat_atom(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
     expr = expr.strip()
     if expr.endswith("++"):
-        return render_expr(expr, fields, counters)
+        return render_expr(expr, fields, counters, helper_functions)
     if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
-        return render_value(expr, fields, counters)
+        return render_value(expr, fields, counters, helper_functions)
     value = render_variable(expr, fields, counters)
     if value is not None:
         return value
-    return render_python_expr(expr, fields, counters)
+    return render_python_expr(expr, fields, counters, helper_functions)
 
 
 def split_top_level(expr: str, separator: str) -> list[str]:
@@ -1124,8 +1180,8 @@ def split_top_level(expr: str, separator: str) -> list[str]:
     return parts
 
 
-def render_template(template: str, fields: dict[str, str], counters: dict) -> str:
-    rendered = render_expr(template, fields, counters)
+def render_template(template: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str:
+    rendered = render_expr(template, fields, counters, helper_functions)
     if rendered:
         return rendered
     raise ValueError(f"Invalid instance expression: {template!r}")
@@ -1156,7 +1212,70 @@ def format_cpp_like(source: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_fragments(pass_def: PassDef, instances: list[dict[str, str]]) -> dict[str, str]:
+def build_helper_functions(
+    helper_defs: dict[str, PassDef],
+    outer_fields: dict[str, str],
+    outer_counters: dict,
+) -> dict[str, object]:
+    helper_functions: dict[str, object] = {}
+
+    for helper_name, helper_def in helper_defs.items():
+        def invoke(input_text, _helper_def=helper_def):
+            return render_helper_pass(_helper_def, str(input_text), outer_fields, outer_counters, helper_defs)
+
+        helper_functions[helper_name] = invoke
+
+    return helper_functions
+
+
+def render_helper_pass(
+    pass_def: PassDef,
+    input_text: str,
+    outer_fields: dict[str, str],
+    outer_counters: dict,
+    helper_defs: dict[str, PassDef],
+) -> str:
+    import copy
+
+    state = {}
+    for key, value in pass_def.init_vars.items():
+        if isinstance(value, list):
+            continue
+        if isinstance(value, (dict, set, tuple)):
+            state[key] = copy.deepcopy(value)
+        else:
+            state[key] = value
+
+    output_parts: list[str] = []
+    pos = skip_c_whitespace(input_text, 0)
+    local_index = 0
+
+    while pos < len(input_text):
+        matched = match_schema_nodes(input_text, pass_def.schema, 0, pos, outer_fields.copy(), allow_trailing=True)
+        if matched is None:
+            snippet = input_text[pos:pos + 40]
+            raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
+
+        end, fields = matched
+        if end <= pos:
+            raise ValueError(f"Helper pass {pass_def.name} made no progress")
+
+        counters = copy.deepcopy(state)
+        counters.update(outer_counters)
+        counters["index"] = local_index
+        helper_functions = build_helper_functions(helper_defs, fields, counters)
+
+        for var, tmpl in pass_def.instance_ops:
+            rendered = render_template(tmpl, fields, counters, helper_functions)
+            output_parts.append(rendered)
+
+        pos = skip_c_whitespace(input_text, end)
+        local_index += 1
+
+    return format_cpp_like("\n".join(output_parts))
+
+
+def render_fragments(pass_def: PassDef, instances: list[dict[str, str]], helper_defs: dict[str, PassDef]) -> dict[str, str]:
     import copy
 
     state = {}
@@ -1175,8 +1294,9 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]]) -> dict
 
     for index, fields in enumerate(instances):
         counters["index"] = index
+        helper_functions = build_helper_functions(helper_defs, fields, counters)
         for var, tmpl in pass_def.instance_ops:
-            rendered = render_template(tmpl, fields, counters)
+            rendered = render_template(tmpl, fields, counters, helper_functions)
             accs[var].append(rendered)
 
     fragments = {}
@@ -1331,27 +1451,31 @@ def main(argv: list[str] | None = None) -> int:
     pass_defs: dict[str, PassDef] = {}
     for block in pass_blocks:
         pass_def = compile_pass(block.text, block.file)
-        if pass_def.name in pass_defs:
+        key = pass_def.name or f"__top_level__:{len([d for d in pass_defs.values() if not d.is_helper])}"
+        if pass_def.name is not None and pass_def.name in pass_defs:
             raise ValueError(f"Duplicate $pass {pass_def.name}")
-        pass_defs[pass_def.name] = pass_def
+        pass_defs[key] = pass_def
         block.replacement = ""
 
-    instances_by_pass = {name: [] for name in pass_defs}
+    top_level_defs = {key: pass_def for key, pass_def in pass_defs.items() if not pass_def.is_helper}
+    helper_defs = {key: pass_def for key, pass_def in pass_defs.items() if pass_def.is_helper and pass_def.name}
+    instances_by_pass = {name: [] for name in top_level_defs}
 
     for block in blocks:
         stripped = block.text.lstrip()
         if stripped.startswith("pass"):
             continue
 
-        pass_name, values = identify_pass(block, pass_defs)
+        pass_name, values = identify_pass(block, top_level_defs)
         instances_by_pass[pass_name].append(values)
 
     output_root.mkdir(parents=True, exist_ok=True)
-    for name, pass_def in pass_defs.items():
-        fragments = render_fragments(pass_def, instances_by_pass[name])
+    for name, pass_def in top_level_defs.items():
+        fragments = render_fragments(pass_def, instances_by_pass[name], helper_defs)
+        folder_name = default_pass_output_name(pass_def, name)
         for fragment_name, content in fragments.items():
             if args.generated_header_root:
-                out_path = output_root / args.generated_header_root / name / f"{args.generated_header_prefix}{fragment_name}.h"
+                out_path = output_root / args.generated_header_root / folder_name / f"{args.generated_header_prefix}{fragment_name}.h"
             else:
                 out_path = output_root / f"{args.generated_header_prefix}{fragment_name}.h"
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1364,7 +1488,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Written: {stamp_path}")
     if not args.no_syntax_hints:
         syntax_hints_path = args.syntax_hints or (output_root / "syntax_hints.h")
-        write_syntax_hints(syntax_hints_path, list(pass_defs))
+        write_syntax_hints(syntax_hints_path, [pass_def.name for pass_def in pass_defs.values() if pass_def.name])
     return 0
 
 

@@ -21,7 +21,7 @@ $tile dirt {
 #include <cstddef>
 #include <iostream>
 
-$pass tile {
+$pass {
   schema() {
     "tile "name" {"
     "texture = "texture";"

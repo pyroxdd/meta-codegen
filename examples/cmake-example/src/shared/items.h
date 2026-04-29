@@ -10,7 +10,7 @@ $item stone {
   weight = 4;
 };
 
-$pass item {
+$pass {
   schema() {
     "item "name" {"
     "weight = "weight";"
