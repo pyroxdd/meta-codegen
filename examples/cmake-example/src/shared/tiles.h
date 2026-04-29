@@ -22,13 +22,6 @@ $tile dirt {
 #include <iostream>
 
 $pass tile {
-  count = 0
-  tile_decls = []
-  tiles = []
-  hits = []
-  textures = []
-  materials = []
-
   schema() {
     "tile "name" {"
     "texture = "texture";"
@@ -40,7 +33,7 @@ $pass tile {
 
   instance() {
     tile_decls += "static const tile "name";"
-    tiles += "inline constexpr tile tile::"name" = {"count++"};"
+    tiles += "inline constexpr tile tile::"name" = {"index"};"
     textures += texture","
     materials += material","
     hits += "case tile::"name".index: {"

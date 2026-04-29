@@ -12,6 +12,11 @@ The generator emits one shared build tree:
 - stripped shared sources are emitted once into the generated root by default
 - consumers include only the generated fragments and stripped shared files they need
 
+Pass authoring notes:
+- fragment outputs are inferred from `name += ...` lines in `instance()`
+- you no longer need `my_fragment = []` declarations in the pass preamble
+- `index` is a built-in per-instance counter starting at `0`
+
 ![Code Generation Example](assets/codegen_example.png)
 
 ## Usage

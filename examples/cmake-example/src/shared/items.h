@@ -11,11 +11,6 @@ $item stone {
 };
 
 $pass item {
-  count = 0
-  item_decls = []
-  items = []
-  item_weights = []
-
   schema() {
     "item "name" {"
     "weight = "weight";"
@@ -24,7 +19,7 @@ $pass item {
 
   instance() {
     item_decls += "static const item "name";"
-    items += "inline constexpr item item::"name" = {"count++"};"
+    items += "inline constexpr item item::"name" = {"index"};"
     item_weights += weight","
   }
 };

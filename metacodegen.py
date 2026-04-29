@@ -32,6 +32,7 @@ class PassDef:
     block_keyword: str
     schema: list["SchemaPart"]
     init_vars: dict
+    instance_targets: list[str]
     instance_ops: list[tuple[str, str]]
 
 
@@ -465,12 +466,14 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     if missing:
         raise ValueError(f"$pass {name} is missing section(s): {', '.join(missing)}")
 
+    instance_ops = parse_instance_section(sections["instance"])
     return PassDef(
         name=name,
         block_keyword=name,
         schema=parse_schema_template(sections["schema"], name, file),
         init_vars=run_init_python(sections.get("python", ""), file),
-        instance_ops=parse_instance_section(sections["instance"]),
+        instance_targets=list(dict.fromkeys(var for var, _ in instance_ops)),
+        instance_ops=instance_ops,
     )
 
 
@@ -1138,20 +1141,23 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]]) -> dict
 
     state = {}
     for key, value in pass_def.init_vars.items():
-        if isinstance(value, (list, dict, set, tuple)):
+        if isinstance(value, list):
+            continue
+        if isinstance(value, (dict, set, tuple)):
             state[key] = copy.deepcopy(value)
         else:
             state[key] = value
     counters = state
-    accs = {k: v for k, v in state.items() if isinstance(v, list)}
+    accs = {key: [] for key in pass_def.instance_targets}
+    for key, value in pass_def.init_vars.items():
+        if isinstance(value, list):
+            accs.setdefault(key, []).extend(copy.deepcopy(value))
 
-    for fields in instances:
+    for index, fields in enumerate(instances):
+        counters["index"] = index
         for var, tmpl in pass_def.instance_ops:
             rendered = render_template(tmpl, fields, counters)
-            if var in accs:
-                accs[var].append(rendered)
-            else:
-                counters[var] = rendered
+            accs[var].append(rendered)
 
     fragments = {}
     for key, value in accs.items():
