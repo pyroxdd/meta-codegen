@@ -614,9 +614,6 @@ def identify_pass(block: MarkerBlock, pass_defs: dict[str, PassDef]) -> tuple[st
             values = parse_instance(block, pass_def)
         except ValueError:
             continue
-        values = values.copy()
-        values["_source"] = block.text.strip()
-        values["_file"] = str(block.file)
         matches.append((name, values))
 
     if not matches:
