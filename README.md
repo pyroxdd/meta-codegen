@@ -7,6 +7,11 @@ but i think it can do the one thing its meant to do pretty well
 
 This example demonstrates the usage of the code generation system.
 
+The generator emits one shared build tree:
+- generated fragments go under a shared `g/` folder
+- stripped shared sources are emitted once into the generated root by default
+- consumers include only the generated fragments and stripped shared files they need
+
 ![Code Generation Example](assets/codegen_example.png)
 
 ## Usage

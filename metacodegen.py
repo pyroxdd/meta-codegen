@@ -1,6 +1,6 @@
 """
-Scans shared source files for $ markers, generates target-specific headers,
-and writes cleaned copies of the shared sources into each target build folder.
+Scans shared source files for $ markers, generates shared headers once,
+and writes cleaned copies of the shared sources into a shared build folder.
 """
 
 import argparse
@@ -1215,44 +1215,28 @@ def resolve_output_path(root: Path, value: str) -> Path:
     return root / path
 
 
-def parse_target_specs(target_specs: list[str], output_root: Path) -> dict[str, Path]:
-    targets: dict[str, Path] = {}
-    for spec in target_specs:
-        if "=" not in spec:
-            raise ValueError(f"Invalid target spec {spec!r}; expected <tag>=<path>")
-        tag, value = spec.split("=", 1)
-        tag = tag.strip()
-        value = value.strip()
-        if not tag or not value:
-            raise ValueError(f"Invalid target spec {spec!r}; expected <tag>=<path>")
-        if tag in targets:
-            raise ValueError(f"Duplicate target tag {tag!r}")
-        targets[tag] = resolve_output_path(output_root, value)
-    return targets
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     if argv and not argv[0].startswith("-"):
-        if len(argv) < 4:
+        if len(argv) < 3:
             raise ValueError(
-                "Legacy usage: metacodegen.py <shared_dir> <gen_py_dir> <output_root> tag=path ..."
+                "Legacy usage: metacodegen.py <shared_dir> <gen_py_dir> <output_root>"
             )
         return argparse.Namespace(
             shared_dir=Path(argv[0]),
             output_root=Path(argv[2]),
             shared_output_root=None,
+            stamp=Path(argv[2]) / "content.stamp",
             generated_header_prefix="",
             generated_header_root="",
             syntax_hints=None,
             no_syntax_hints=False,
             source_suffixes=list(DEFAULT_SOURCE_SUFFIXES),
-            targets=argv[3:],
         )
 
     parser = argparse.ArgumentParser(
         description=(
-            "Scan shared source files for $ markers, generate target-specific headers, "
-            "and emit stripped shared sources for integration into build outputs."
+            "Scan shared source files for $ markers, generate shared headers once, "
+            "and emit stripped shared sources for integration into a shared build output."
         )
     )
     parser.add_argument("--shared-dir", required=True, type=Path, help="Source directory that contains shared files")
@@ -1266,7 +1250,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--shared-output-root",
         type=Path,
         default=None,
-        help="Optional extra directory for stripped shared sources in addition to per-target outputs",
+        help="Optional separate directory for stripped shared sources; defaults to --output-root",
+    )
+    parser.add_argument(
+        "--stamp",
+        type=Path,
+        default=None,
+        help="Optional stamp file written after generation; defaults to <output-root>/content.stamp",
     )
     parser.add_argument(
         "--generated-header-prefix",
@@ -1276,14 +1266,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--generated-header-root",
         default="",
-        help="Optional directory under each target where generated fragment headers are organized by pass, e.g. g/tile/textures.h",
-    )
-    parser.add_argument(
-        "--target",
-        dest="targets",
-        action="append",
-        default=[],
-        help="Target output spec in the form <tag>=<stamp-or-output-path>",
+        help="Optional directory under the output root where generated fragment headers are organized by pass, e.g. g/tile/textures.h",
     )
     parser.add_argument(
         "--syntax-hints",
@@ -1303,17 +1286,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=list(DEFAULT_SOURCE_SUFFIXES),
         help="File suffix to scan and rewrite; can be provided multiple times",
     )
-    args = parser.parse_args(argv)
-    if not args.targets:
-        parser.error("at least one --target <tag>=<path> is required")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     shared_dir = args.shared_dir
     output_root = args.output_root
-    out_map = parse_target_specs(args.targets, output_root)
+    shared_output_root = args.shared_output_root or output_root
+    stamp_path = args.stamp or (output_root / "content.stamp")
     source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
 
     blocks, strip_map = discover_blocks(shared_dir, source_suffixes)
@@ -1339,25 +1320,22 @@ def main(argv: list[str] | None = None) -> int:
         pass_name, values = identify_pass(block, pass_defs)
         instances_by_pass[pass_name].append(values)
 
-    for tag, stamp_path in out_map.items():
-        target_root = stamp_path.parent
-        target_root.mkdir(parents=True, exist_ok=True)
-        for name, pass_def in pass_defs.items():
-            fragments = render_fragments(pass_def, instances_by_pass[name])
-            for fragment_name, content in fragments.items():
-                if args.generated_header_root:
-                    out_path = target_root / args.generated_header_root / name / f"{args.generated_header_prefix}{fragment_name}.h"
-                else:
-                    out_path = target_root / f"{args.generated_header_prefix}{fragment_name}.h"
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(content)
-                print(f"Written {tag}: {out_path}")
-        write_generated_sources(shared_dir, strip_map, target_root, source_suffixes)
-        stamp_path.write_text("# Generated by codegen\n")
-        print(f"Written {tag}: {stamp_path}")
+    output_root.mkdir(parents=True, exist_ok=True)
+    for name, pass_def in pass_defs.items():
+        fragments = render_fragments(pass_def, instances_by_pass[name])
+        for fragment_name, content in fragments.items():
+            if args.generated_header_root:
+                out_path = output_root / args.generated_header_root / name / f"{args.generated_header_prefix}{fragment_name}.h"
+            else:
+                out_path = output_root / f"{args.generated_header_prefix}{fragment_name}.h"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(content)
+            print(f"Written: {out_path}")
 
-    if args.shared_output_root is not None:
-        write_generated_sources(shared_dir, strip_map, args.shared_output_root, source_suffixes)
+    write_generated_sources(shared_dir, strip_map, shared_output_root, source_suffixes)
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_path.write_text("# Generated by codegen\n")
+    print(f"Written: {stamp_path}")
     if not args.no_syntax_hints:
         syntax_hints_path = args.syntax_hints or (output_root / "syntax_hints.h")
         write_syntax_hints(syntax_hints_path, list(pass_defs))
