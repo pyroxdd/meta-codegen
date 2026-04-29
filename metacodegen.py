@@ -1,11 +1,10 @@
 """
 Scans shared source files for $ markers, generates target-specific headers,
 and writes cleaned copies of the shared sources into each target build folder.
-
-Usage can be found at start of main()
 """
 
 import argparse
+import ast
 import re
 import sys
 import textwrap
@@ -781,8 +780,11 @@ def iter_capture_end_positions(source: str, start: int):
 
 def render_value(expr: str, fields: dict[str, str], counters: dict) -> str:
     expr = expr.strip()
-    if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
-        return expr[1:-1]
+    if len(expr) >= 2 and expr[0] in "\"'" and expr[-1] == expr[0]:
+        try:
+            return str(ast.literal_eval(expr))
+        except Exception:
+            return expr[1:-1]
     if expr in fields:
         return fields[expr]
     if expr in counters:
@@ -1000,6 +1002,7 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict) ->
             continue
 
         if expr[i] == '"':
+            literal_start = i
             i += 1
             escaped = False
             value = []
@@ -1017,7 +1020,11 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict) ->
                 i += 1
             if i >= len(expr) or expr[i] != '"':
                 return None
-            pieces.append("".join(value))
+            literal = expr[literal_start:i + 1]
+            try:
+                pieces.append(str(ast.literal_eval(literal)))
+            except Exception:
+                pieces.append("".join(value))
             i += 1
             saw_token = True
             continue
