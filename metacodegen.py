@@ -5,10 +5,11 @@ and writes cleaned copies of the shared sources into a shared build folder.
 
 import argparse
 import ast
+import json
 import re
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ class PassDef:
     instance_targets: list[str]
     instance_ops: list["InstanceOp"]
     is_helper: bool = False
+    local_helper_defs: dict[str, "PassDef"] = field(default_factory=dict)
 
 
 @dataclass
@@ -61,6 +63,34 @@ class SchemaPart:
     value: str = ""
     alternatives: list[list["SchemaPart"]] | None = None
     capture_name: str | None = None
+
+
+class SymbolicExpr:
+    def __init__(self, expr: str):
+        self.expr = expr
+
+    def __str__(self) -> str:
+        return self.expr
+
+    def __repr__(self) -> str:
+        return self.expr
+
+    def _coerce(self, other) -> str:
+        if isinstance(other, SymbolicExpr):
+            return other.expr
+        return str(other)
+
+    def __add__(self, other):
+        return SymbolicExpr(f"({self.expr} + {self._coerce(other)})")
+
+    def __radd__(self, other):
+        return SymbolicExpr(f"({self._coerce(other)} + {self.expr})")
+
+    def __sub__(self, other):
+        return SymbolicExpr(f"({self.expr} - {self._coerce(other)})")
+
+    def __rsub__(self, other):
+        return SymbolicExpr(f"({self._coerce(other)} - {self.expr})")
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
@@ -587,10 +617,10 @@ def declared_instance_aliases(ops: list[InstanceOp]) -> set[str]:
     }
 
 
-def parse_pass_header(header: str, file: Path) -> tuple[str | None, list[str]]:
-    m = re.match(r"pass(?:[ \t]+(\w+)(?:\(([^)]*)\))?)?\s*\{?\s*;?\s*$", header)
+def parse_named_block_header(header: str, file: Path, keyword: str) -> tuple[str | None, list[str]]:
+    m = re.match(rf"{re.escape(keyword)}(?:[ \t]+(\w+)(?:\(([^)]*)\))?)?\s*\{{?\s*;?\s*$", header)
     if not m:
-        raise ValueError(f"Expected $pass or $pass <name>(...) in {file}")
+        raise ValueError(f"Expected {keyword} or {keyword} <name>(...) in {file}")
     name = m.group(1)
     output_params = []
     if m.group(2):
@@ -598,10 +628,16 @@ def parse_pass_header(header: str, file: Path) -> tuple[str | None, list[str]]:
     return name, output_params
 
 
-def pass_name(pass_text: str, file: Path) -> str | None:
-    first_line = pass_text.lstrip().splitlines()[0].strip()
-    name, _ = parse_pass_header(first_line, file)
-    return name
+def parse_pass_header(header: str, file: Path) -> tuple[list[str], bool]:
+    m = re.match(r"pass(?:[ \t]+(\w+)(?:\(([^)]*)\))?)?\s*\{?\s*;?\s*$", header)
+    if not m:
+        raise ValueError(f"Expected pass in {file}")
+    if m.group(1) is not None:
+        raise ValueError(f"Top-level pass in {file} cannot be named; use nested rule <name>(...) for helpers")
+    output_params = []
+    if m.group(2):
+        output_params = [part.strip() for part in m.group(2).split(",") if part.strip()]
+    return output_params, m.group(2) is not None
 
 
 def unwrap_pass_block(pass_text: str) -> str:
@@ -613,13 +649,39 @@ def unwrap_pass_block(pass_text: str) -> str:
     return "\n".join(lines)
 
 
-def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str | None, str, str]:
+def find_top_level_named_blocks(source: str, keyword: str) -> list[tuple[int, int]]:
+    positions: list[tuple[int, int]] = []
+    for match in re.finditer(rf"(?m)^[ \t]*{re.escape(keyword)}\b", source):
+        start = match.start()
+        if positions and start < positions[-1][1]:
+            continue
+        positions.append((start, block_end(source, start)))
+    return positions
+
+
+def extract_top_level_named_blocks(source: str, keyword: str) -> tuple[str, list[str]]:
+    blocks = find_top_level_named_blocks(source, keyword)
+    if not blocks:
+        return source, []
+
+    parts = []
+    extracted = []
+    cursor = 0
+    for start, end in blocks:
+        parts.append(source[cursor:start])
+        extracted.append(source[start:end])
+        cursor = end
+    parts.append(source[cursor:])
+    return "".join(parts), extracted
+
+
+def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str, str]:
     stripped = pass_text.strip()
-    header_match = re.match(r"pass(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{", stripped)
+    header_match = re.match(r"pass\s*\{", stripped)
     if header_match is None:
         raise ValueError(f"Expected compact pass syntax in {file}")
 
-    name, _ = parse_pass_header(stripped[:header_match.end() - 1].strip(), file)
+    parse_pass_header(stripped[:header_match.end() - 1].strip(), file)
     schema_open = stripped.find("{", header_match.start(), header_match.end())
     schema_close = matching_brace(stripped, schema_open)
     if schema_close is None:
@@ -638,7 +700,7 @@ def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str | None,
     if trailing not in ("", ";"):
         raise ValueError(f"Unexpected trailing pass syntax in {file}: {trailing!r}")
 
-    return name, schema_body, instance_body
+    return schema_body, instance_body
 
 
 def normalize_compact_python(python_text: str) -> str:
@@ -692,95 +754,158 @@ def split_compact_schema_block(block_body: str, pass_name: str | None, file: Pat
     return candidates[-1]
 
 
-def compile_pass(pass_text: str, file: Path) -> PassDef:
-    stripped_pass = pass_text.strip()
-    compact_match = re.match(r"pass(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{", stripped_pass)
-    if compact_match is not None and "schema" not in stripped_pass and "instance" not in stripped_pass:
-        name, first_block_body, instance_body = parse_compact_pass_sections(stripped_pass, file)
-        output_params = parse_pass_header(stripped_pass[:compact_match.end() - 1].strip(), file)[1]
+def compile_rule(rule_text: str, file: Path) -> PassDef:
+    stripped_rule = rule_text.strip()
+    compact_match = re.match(r"rule(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{", stripped_rule)
+    if compact_match is not None and "schema" not in stripped_rule and "instance" not in stripped_rule:
+        name, output_params = parse_named_block_header(stripped_rule[:compact_match.end() - 1].strip(), file, "rule")
+        schema_open = stripped_rule.find("{", compact_match.start(), compact_match.end())
+        schema_close = matching_brace(stripped_rule, schema_open)
+        if schema_close is None:
+            raise ValueError(f"Compact rule in {file} has an unterminated schema block")
+        first_block_body = stripped_rule[schema_open + 1:schema_close].strip()
+
+        instance_open = skip_c_whitespace(stripped_rule, schema_close + 1)
+        if instance_open >= len(stripped_rule) or stripped_rule[instance_open] != "{":
+            raise ValueError(f"Compact rule in {file} is missing instance block")
+        instance_close = matching_brace(stripped_rule, instance_open)
+        if instance_close is None:
+            raise ValueError(f"Compact rule in {file} has an unterminated instance block")
+        instance_body = stripped_rule[instance_open + 1:instance_close].strip()
+
+        trailing = stripped_rule[instance_close + 1:].strip()
+        if trailing not in ("", ";"):
+            raise ValueError(f"Unexpected trailing rule syntax in {file}: {trailing!r}")
         raw_python, schema_body = split_compact_schema_block(first_block_body, name, file)
         sections = {"python": raw_python, "schema": schema_body, "instance": instance_body}
     else:
-        pass_text = unwrap_pass_block(pass_text)
-        first_line = pass_text.lstrip().splitlines()[0].strip()
-        name, output_params = parse_pass_header(first_line, file)
-        sections = parse_pass_file(pass_text)
+        unwrapped = unwrap_pass_block(re.sub(r"^\s*rule\b", "pass", stripped_rule, count=1))
+        lines = unwrapped.lstrip().splitlines()
+        first_line = lines[0].strip()
+        name, output_params = parse_named_block_header(first_line.replace("pass", "rule", 1), file, "rule")
+        rebuilt_rule_text = first_line
+        body_text = "\n".join(lines[1:])
+        if body_text:
+            rebuilt_rule_text += "\n" + body_text
+        sections = parse_pass_file(rebuilt_rule_text)
         missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
         if missing:
-            display_name = name or "<top-level>"
-            raise ValueError(f"$pass {display_name} is missing section(s): {', '.join(missing)}")
+            raise ValueError(f"rule {name or '<unnamed>'} is missing section(s): {', '.join(missing)}")
+        raw_python = sections.get("python", "")
+
+    if name is None:
+        raise ValueError(f"rule in {file} must declare a name")
+
+    instance_ops = parse_instance_section(sections["instance"])
+    declared_aliases = declared_instance_aliases(instance_ops)
+    if not output_params:
+        raise ValueError(f"rule {name} must declare at least one output parameter; implicit return output is not supported")
+    invalid_targets = sorted({
+        op.target for op in iter_instance_ops(instance_ops)
+        if op.kind == "emit" and op.target not in output_params and op.target not in declared_aliases
+    })
+    if invalid_targets:
+        raise ValueError(f"rule {name} may only write to declared outputs {output_params}, found: {', '.join(invalid_targets)}")
+    for op in iter_instance_ops(instance_ops):
+        if op.kind == "assign":
+            if op.source_target is None:
+                continue
+            if op.source_target not in output_params and op.source_target not in declared_aliases:
+                raise ValueError(
+                    f"rule {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
+                )
+
+    return PassDef(
+        name=name,
+        block_keyword=name,
+        schema=parse_schema_template(sections["schema"], name, file),
+        init_vars=run_init_python(raw_python, file),
+        output_params=output_params,
+        instance_targets=[],
+        instance_ops=instance_ops,
+        is_helper=True,
+    )
+
+
+def compile_pass(pass_text: str, file: Path) -> PassDef:
+    stripped_pass = pass_text.strip()
+    compact_match = re.match(r"pass\s*\{", stripped_pass)
+    local_helper_defs: dict[str, PassDef] = {}
+    if compact_match is not None and "schema" not in stripped_pass and "instance" not in stripped_pass:
+        first_block_body, instance_body = parse_compact_pass_sections(stripped_pass, file)
+        output_params, _ = parse_pass_header(stripped_pass[:compact_match.end() - 1].strip(), file)
+        raw_python, schema_body = split_compact_schema_block(first_block_body, None, file)
+        sections = {"python": raw_python, "schema": schema_body, "instance": instance_body}
+    else:
+        pass_text = unwrap_pass_block(pass_text)
+        lines = pass_text.lstrip().splitlines()
+        first_line = lines[0].strip()
+        output_params, has_outputs = parse_pass_header(first_line, file)
+        if has_outputs:
+            raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested rule <name>(...) for helpers")
+        body_text = "\n".join(lines[1:])
+        body_text, rule_texts = extract_top_level_named_blocks(body_text, "rule")
+        for rule_text in rule_texts:
+            rule_def = compile_rule(rule_text, file)
+            if rule_def.name in local_helper_defs:
+                raise ValueError(f"Duplicate rule {rule_def.name} in {file}")
+            local_helper_defs[rule_def.name] = rule_def
+        rebuilt_pass_text = first_line
+        if body_text:
+            rebuilt_pass_text += "\n" + body_text
+        sections = parse_pass_file(rebuilt_pass_text)
+        missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
+        if missing:
+            raise ValueError(f"Top-level $pass in {file} is missing section(s): {', '.join(missing)}")
         raw_python = sections.get("python", "")
 
     instance_ops = parse_instance_section(sections["instance"])
     declared_aliases = declared_instance_aliases(instance_ops)
-    is_helper = name is not None
-    if is_helper:
-        if not output_params:
-            raise ValueError(f"$pass {name} must declare at least one output parameter; implicit return output is no longer supported")
-        invalid_targets = sorted({
-            op.target for op in iter_instance_ops(instance_ops)
-            if op.kind == "emit" and op.target not in output_params and op.target not in declared_aliases
-        })
-        if invalid_targets:
-            raise ValueError(f"$pass {name} may only write to declared outputs {output_params}, found: {', '.join(invalid_targets)}")
-        for op in iter_instance_ops(instance_ops):
-            if op.kind == "assign":
-                if op.source_target is None:
-                    continue
-                if op.source_target not in output_params and op.source_target not in declared_aliases:
-                    raise ValueError(
-                        f"$pass {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
-                    )
-            if op.kind == "call":
-                if op.output_targets is None:
-                    continue
-                # arity checked later once helper defs are known
-                pass
-    else:
-        invalid_emit_targets = sorted({
-            op.target for op in iter_instance_ops(instance_ops)
-            if op.kind == "emit" and op.target is not None and not target_is_allowed(op.target, declared_aliases)
-        })
-        if invalid_emit_targets:
-            raise ValueError(
-                f"Top-level $pass in {file} must write to outputs using 'out.<name> += ...' or a declared variable, found: {', '.join(invalid_emit_targets)}"
-            )
-        invalid_assignments = []
-        for op in iter_instance_ops(instance_ops):
-            if op.kind != "assign":
-                continue
-            if op.source_target is None:
-                continue
-            if not target_is_allowed(op.source_target, declared_aliases):
-                invalid_assignments.append(op.source_target)
-        if invalid_assignments:
-            raise ValueError(
-                f"Top-level $pass in {file} may only bind variables to 'out.<name>' sinks or other declared variables, found: {', '.join(invalid_assignments)}"
-            )
-        invalid_call_targets = sorted({
-            target
-            for op in iter_instance_ops(instance_ops)
-            if op.kind == "call" and op.output_targets is not None
-            for target in op.output_targets
-            if not target_is_allowed(target, declared_aliases)
-        })
-        if invalid_call_targets:
-            raise ValueError(
-                f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling named passes, found: {', '.join(invalid_call_targets)}"
-            )
+    invalid_emit_targets = sorted({
+        op.target for op in iter_instance_ops(instance_ops)
+        if op.kind == "emit" and op.target is not None and not target_is_allowed(op.target, declared_aliases)
+    })
+    if invalid_emit_targets:
+        raise ValueError(
+            f"Top-level $pass in {file} must write to outputs using 'out.<name> += ...' or a declared variable, found: {', '.join(invalid_emit_targets)}"
+        )
+    invalid_assignments = []
+    for op in iter_instance_ops(instance_ops):
+        if op.kind != "assign":
+            continue
+        if op.source_target is None:
+            continue
+        if not target_is_allowed(op.source_target, declared_aliases):
+            invalid_assignments.append(op.source_target)
+    if invalid_assignments:
+        raise ValueError(
+            f"Top-level $pass in {file} may only bind variables to 'out.<name>' sinks or other declared variables, found: {', '.join(invalid_assignments)}"
+        )
+    invalid_call_targets = sorted({
+        target
+        for op in iter_instance_ops(instance_ops)
+        if op.kind == "call" and op.output_targets is not None
+        for target in op.output_targets
+        if not target_is_allowed(target, declared_aliases)
+    })
+    if invalid_call_targets:
+        raise ValueError(
+            f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling named rules, found: {', '.join(invalid_call_targets)}"
+        )
     return PassDef(
-        name=name,
-        block_keyword=name or "__top_level__",
-        schema=parse_schema_template(sections["schema"], name, file),
+        name=None,
+        block_keyword="__top_level__",
+        schema=parse_schema_template(sections["schema"], None, file),
         init_vars=run_init_python(raw_python, file),
         output_params=output_params,
         instance_targets=list(dict.fromkeys(
             normalize_output_target(op.target)
             for op in iter_instance_ops(instance_ops)
-            if op.kind == "emit" and op.target is not None and (not is_helper) and op.target not in declared_aliases
+            if op.kind == "emit" and op.target is not None and op.target not in declared_aliases
         )),
         instance_ops=instance_ops,
-        is_helper=is_helper,
+        is_helper=False,
+        local_helper_defs=local_helper_defs,
     )
 
 
@@ -1123,8 +1248,29 @@ def default_pass_output_name(pass_def: PassDef, fallback: str) -> str:
     return fallback.replace(":", "_")
 
 
+def sanitize_path_token(path: Path | str) -> str:
+    text = str(path)
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text.lower() or "pass"
+
+
 def normalize_output_target(target: str) -> str:
     return target[4:] if target.startswith("out.") else target
+
+
+def collect_declared_output_targets(instance_ops: list[InstanceOp]) -> list[str]:
+    targets: list[str] = []
+    for op in iter_instance_ops(instance_ops):
+        if op.kind == "emit" and op.target is not None and op.target.startswith("out."):
+            targets.append(normalize_output_target(op.target))
+        elif op.kind == "assign" and op.source_target is not None and op.source_target.startswith("out."):
+            targets.append(normalize_output_target(op.source_target))
+        elif op.kind == "call" and op.output_targets is not None:
+            for target in op.output_targets:
+                if target.startswith("out."):
+                    targets.append(normalize_output_target(target))
+    return list(dict.fromkeys(targets))
 
 
 def target_is_allowed(target: str, declared_aliases: set[str]) -> bool:
@@ -1550,6 +1696,7 @@ def execute_instance_ops(
                     instance_targets=pass_def.instance_targets,
                     instance_ops=branch_ops,
                     is_helper=pass_def.is_helper,
+                    local_helper_defs=pass_def.local_helper_defs,
                 )
                 execute_instance_ops(nested_pass, fields, counters, helper_defs, local_output_bindings, global_accs)
             continue
@@ -1599,7 +1746,12 @@ def execute_named_pass(
         local_index += 1
 
 
-def render_fragments(pass_def: PassDef, instances: list[dict[str, str]], helper_defs: dict[str, PassDef]) -> dict[str, str]:
+def render_fragments(
+    pass_def: PassDef,
+    instances: list[dict[str, str]],
+    helper_defs: dict[str, PassDef],
+    index_base_expr: str | None = None,
+) -> dict[str, str]:
     import copy
 
     state = {}
@@ -1617,7 +1769,13 @@ def render_fragments(pass_def: PassDef, instances: list[dict[str, str]], helper_
             accs.setdefault(key, []).extend(copy.deepcopy(value))
 
     for index, fields in enumerate(instances):
-        counters["index"] = index
+        counters["local_index"] = index
+        if index_base_expr is None:
+            counters["index"] = index
+        elif index == 0:
+            counters["index"] = SymbolicExpr(index_base_expr)
+        else:
+            counters["index"] = SymbolicExpr(f"({index_base_expr} + {index})")
         execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs)
 
     fragments = {}
@@ -1654,14 +1812,294 @@ def write_generated_sources(
             out = strip_marker_blocks(source, strip_map.get(file, []))
         else:
             out = source
-        out_path.write_text(out)
+        if write_text_if_changed(out_path, out):
+            print(f"Written: {out_path}")
+
+
+def write_text_if_changed(out_path: Path, content: str) -> bool:
+    if out_path.exists():
+        existing = out_path.read_text()
+        if existing == content:
+            return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content)
+    return True
+
+
+def delete_file_if_exists(path: Path) -> bool:
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def compile_pass_inventory(
+    passes_dir: Path,
+    generated_header_root: str,
+    generated_header_prefix: str,
+    source_suffixes: tuple[str, ...],
+) -> list[dict]:
+    blocks, _ = discover_blocks(passes_dir, source_suffixes)
+    pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
+    if not pass_blocks:
+        raise ValueError(f"No $pass block found under {passes_dir}")
+
+    pass_blocks_by_file: dict[Path, list[MarkerBlock]] = {}
+    for block in pass_blocks:
+        pass_blocks_by_file.setdefault(block.file, []).append(block)
+    duplicate_files = [file for file, file_blocks in pass_blocks_by_file.items() if len(file_blocks) > 1]
+    if duplicate_files:
+        duplicate_list = ", ".join(str(file.relative_to(passes_dir)) for file in sorted(duplicate_files))
+        raise ValueError(f"Only one $pass block is allowed per file; split these files: {duplicate_list}")
+
+    inventory: list[dict] = []
+    for block in pass_blocks:
+        pass_def = compile_pass(block.text, block.file)
+        rel_file = block.file.relative_to(passes_dir)
+        pass_name = sanitize_path_token(rel_file.stem)
+        pass_id = pass_name
+        outputs = []
+        for fragment_name in collect_declared_output_targets(pass_def.instance_ops):
+            rel_output = Path(f"{generated_header_prefix}{fragment_name}.h")
+            if generated_header_root:
+                rel_output = Path(generated_header_root) / rel_output
+            outputs.append(rel_output.as_posix())
+
+        inventory.append({
+            "id": pass_id,
+            "defined_in": rel_file.as_posix(),
+            "source_file": str(block.file),
+            "block_index_in_file": 0,
+            "folder": pass_name,
+            "outputs": outputs,
+            "pass_text": block.text.strip(),
+            "rule_count": len(pass_def.local_helper_defs),
+        })
+
+    return inventory
+
+
+def write_pass_descriptor(out_path: Path, entry: dict) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_counts: dict[str, int] = {}
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+            raw_counts = existing.get("counts", {})
+            if isinstance(raw_counts, dict):
+                existing_counts = {str(key): int(value) for key, value in raw_counts.items()}
+        except Exception:
+            existing_counts = {}
+    descriptor = {
+        "id": entry["id"],
+        "defined_in": entry["defined_in"],
+        "source_file": entry["source_file"],
+        "block_index_in_file": entry["block_index_in_file"],
+        "folder": entry["folder"],
+        "outputs": entry["outputs"],
+        "pass_text": entry["pass_text"],
+        "rule_count": entry["rule_count"],
+        "counts": existing_counts,
+    }
+    if write_text_if_changed(out_path, json.dumps(descriptor, indent=2) + "\n"):
         print(f"Written: {out_path}")
+
+
+def remove_stale_pass_artifacts(build_root: Path, active_ids: set[str]) -> None:
+    build_root.mkdir(parents=True, exist_ok=True)
+    active_names = {f"pass_{pass_id}.json" for pass_id in active_ids}
+    for path in build_root.iterdir():
+        if not path.is_file():
+            continue
+        if path.name.startswith("pass_") and path.suffix == ".py":
+            path.unlink()
+            print(f"Removed legacy pass artifact: {path}")
+            continue
+        if path.name.startswith("pass_") and path.suffix == ".json" and path.name not in active_names:
+            path.unlink()
+            print(f"Removed stale pass artifact: {path}")
+
+
+def discover_blocks_in_file(file: Path) -> tuple[list[MarkerBlock], list[MarkerBlock], str]:
+    source = file.read_text()
+    blocks: list[MarkerBlock] = []
+    positions = marker_positions(source)
+    for start in positions:
+        end = block_end(source, start)
+        text = source[start + MARKER_LEN:end]
+        blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
+    return blocks, blocks.copy(), source
+
+
+def iter_pass_descriptor_paths(build_root: Path) -> list[Path]:
+    return sorted(build_root.glob("pass_*.json"))
+
+
+def load_pass_defs_from_build_root(build_root: Path) -> list[tuple[dict, PassDef]]:
+    entries = []
+    for descriptor_path in iter_pass_descriptor_paths(build_root):
+        entries.append(json.loads(descriptor_path.read_text()))
+    loaded: list[tuple[dict, PassDef]] = []
+    for entry in entries:
+        pass_text = entry.get("pass_text")
+        source_file = entry.get("source_file")
+        if not pass_text:
+            raise ValueError(f"Pass descriptor {entry.get('id', '<unknown>')} does not define pass_text")
+        pass_def = compile_pass(pass_text, Path(source_file))
+        loaded.append((entry, pass_def))
+    return loaded
+
+
+def load_pass_entry(build_root: Path, pass_id: str) -> dict:
+    descriptor_path = build_root / f"pass_{pass_id}.json"
+    if not descriptor_path.exists():
+        raise ValueError(f"Unknown pass id {pass_id!r} in {build_root}")
+    return json.loads(descriptor_path.read_text())
+
+
+def aggregate_output_path(output_root: Path, rel_output: str) -> Path:
+    return output_root / Path(rel_output)
+
+
+def output_subdir_rel_path(rel_output: str) -> Path:
+    output_path = Path(rel_output)
+    return output_path.parent / output_path.stem
+
+
+def pass_header_rel_output_path(entry: dict, rel_output: str) -> Path:
+    return output_subdir_rel_path(rel_output) / f"{entry['id']}.h"
+
+
+def fragment_header_rel_output_path(entry: dict, rel_output: str, rel_file: Path) -> Path:
+    return output_subdir_rel_path(rel_output) / entry["id"] / f"{sanitize_path_token(rel_file)}.h"
+
+
+def read_instance_count(entry: dict, rel_file: Path) -> int:
+    raw_counts = entry.get("counts", {})
+    if not isinstance(raw_counts, dict):
+        return 0
+    return int(raw_counts.get(rel_file.as_posix(), 0))
+
+
+def compute_index_base(
+    entry: dict,
+    rel_file: Path,
+    rel_source_files: list[Path],
+) -> int:
+    total = 0
+    for candidate in rel_source_files:
+        if candidate == rel_file:
+            break
+        total += read_instance_count(entry, candidate)
+    return total
+
+
+def update_pass_count(build_root: Path, pass_id: str, rel_file: Path, count: int) -> None:
+    descriptor_path = build_root / f"pass_{pass_id}.json"
+    data = json.loads(descriptor_path.read_text())
+    counts = data.setdefault("counts", {})
+    rel_key = rel_file.as_posix()
+    if count == 0:
+        counts.pop(rel_key, None)
+    else:
+        counts[rel_key] = count
+    if write_text_if_changed(descriptor_path, json.dumps(data, indent=2) + "\n"):
+        print(f"Written: {descriptor_path}")
+
+
+def write_pass_file_shards(
+    entry: dict,
+    pass_def: PassDef,
+    rel_file: Path,
+    instances: list[dict[str, str]],
+    output_root: Path,
+    build_root: Path,
+    rel_source_files: list[Path],
+) -> list[Path]:
+    fragment_names = collect_declared_output_targets(pass_def.instance_ops)
+    written_paths: list[Path] = []
+    outputs = entry.get("outputs", [])
+    if len(outputs) != len(fragment_names):
+        raise ValueError(
+            f"Manifest outputs for pass {entry['id']} do not match fragment count: {len(outputs)} vs {len(fragment_names)}"
+        )
+
+    index_base = compute_index_base(entry, rel_file, rel_source_files)
+    rendered_fragments = render_fragments(
+        pass_def,
+        instances,
+        pass_def.local_helper_defs,
+        str(index_base),
+    )
+
+    for rel_output, fragment_name in zip(outputs, fragment_names):
+        out_path = output_root / fragment_header_rel_output_path(entry, rel_output, rel_file)
+        content = rendered_fragments.get(fragment_name, "").rstrip()
+        if content:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            content += "\n"
+            if write_text_if_changed(out_path, content):
+                print(f"Written: {out_path}")
+            written_paths.append(out_path)
+        else:
+            if delete_file_if_exists(out_path):
+                print(f"Removed empty fragment: {out_path}")
+
+    update_pass_count(build_root, entry["id"], rel_file, len(instances))
+
+    return written_paths
+
+
+def write_public_output_headers(entries: list[dict], output_root: Path) -> list[Path]:
+    written_paths: list[Path] = []
+    outputs_to_entries: dict[str, list[dict]] = {}
+    for entry in entries:
+        for rel_output in entry.get("outputs", []):
+            outputs_to_entries.setdefault(rel_output, []).append(entry)
+
+    for rel_output, output_entries in outputs_to_entries.items():
+        out_path = aggregate_output_path(output_root, rel_output)
+        lines = ["#pragma once", ""]
+        for entry in output_entries:
+            lines.append(f'#include "{pass_header_rel_output_path(entry, rel_output).as_posix()}"')
+        content = "\n".join(lines).rstrip() + "\n"
+        if write_text_if_changed(out_path, content):
+            print(f"Written: {out_path}")
+        written_paths.append(out_path)
+    return written_paths
+
+
+def write_pass_aggregate_headers(
+    entries: list[dict],
+    shared_dir: Path,
+    output_root: Path,
+    source_suffixes: tuple[str, ...],
+) -> list[Path]:
+    rel_source_files = [
+        file.relative_to(shared_dir)
+        for file in iter_source_files(shared_dir, source_suffixes)
+    ]
+    written_paths: list[Path] = []
+    for entry in entries:
+        for rel_output in entry.get("outputs", []):
+            pass_out_path = output_root / pass_header_rel_output_path(entry, rel_output)
+            pass_lines = ["#pragma once", ""]
+            for rel_file in rel_source_files:
+                fragment_path = output_root / fragment_header_rel_output_path(entry, rel_output, rel_file)
+                if fragment_path.exists():
+                    pass_lines.append(f'#include "{fragment_header_rel_output_path(entry, rel_output, rel_file).as_posix()}"')
+            pass_content = "\n".join(pass_lines).rstrip() + "\n"
+            if write_text_if_changed(pass_out_path, pass_content):
+                print(f"Written: {pass_out_path}")
+            written_paths.append(pass_out_path)
+
+    return written_paths
 
 
 def write_syntax_hints(out_path: Path, pass_names: list[str]) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pass_macros = "\n".join(f"#define ${name} struct" for name in sorted(pass_names))
-    out_path.write_text(f"""#pragma once
+    content = f"""#pragma once
 
 // Editor-only helper for source files that contain $ transpiler markers.
 // GCC and Clang accept '$' in identifiers, so these macros make marker
@@ -1669,8 +2107,9 @@ def write_syntax_hints(out_path: Path, pass_names: list[str]) -> None:
 #define $pass struct
 {pass_macros}
 
-""")
-    print(f"Written syntax hints: {out_path}")
+"""
+    if write_text_if_changed(out_path, content):
+        print(f"Written syntax hints: {out_path}")
 
 
 def resolve_output_path(root: Path, value: str) -> Path:
@@ -1680,13 +2119,82 @@ def resolve_output_path(root: Path, value: str) -> Path:
     return root / path
 
 
+def parse_compile_passes_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compile pass definitions into per-pass descriptors."
+    )
+    parser.add_argument("--passes-dir", required=True, type=Path, help="Directory that contains pass source files")
+    parser.add_argument("--build-root", required=True, type=Path, help="Directory where generated pass descriptors are written")
+    parser.add_argument("--shared-dir", type=Path, default=None, help="Optional shared source root used to emit aggregate headers")
+    parser.add_argument("--output-root", type=Path, default=None, help="Output root for aggregate generated headers when --shared-dir is set")
+    parser.add_argument(
+        "--generated-header-prefix",
+        default="",
+        help="Optional prefix added to generated fragment header filenames",
+    )
+    parser.add_argument(
+        "--generated-header-root",
+        default="",
+        help="Optional directory prefix for generated fragment headers, e.g. g",
+    )
+    parser.add_argument(
+        "--source-suffix",
+        dest="source_suffixes",
+        action="append",
+        default=list(DEFAULT_SOURCE_SUFFIXES),
+        help="File suffix to scan; can be provided multiple times",
+    )
+    return parser.parse_args(argv)
+
+
+def parse_process_file_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Process one source file using compiled pass descriptors and emit per-pass shard headers."
+    )
+    parser.add_argument("--build-root", required=True, type=Path, help="Directory that contains generated pass descriptors")
+    parser.add_argument("--input", required=True, type=Path, help="Source file to process")
+    parser.add_argument("--shared-root", required=True, type=Path, help="Root directory of shared source files")
+    parser.add_argument("--shared-output-root", required=True, type=Path, help="Output root for stripped shared files")
+    return parser.parse_args(argv)
+
+
+def parse_assemble_pass_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rewrite aggregate generated headers for one pass."
+    )
+    parser.add_argument("--build-root", required=True, type=Path, help="Directory that contains generated pass descriptors")
+    parser.add_argument("--pass-id", required=True, help="Pass id to assemble")
+    parser.add_argument("--shared-root", required=True, type=Path, help="Root directory of shared source files")
+    parser.add_argument("--output-root", required=True, type=Path, help="Root directory for assembled generated headers")
+    parser.add_argument(
+        "--source-suffix",
+        dest="source_suffixes",
+        action="append",
+        default=list(DEFAULT_SOURCE_SUFFIXES),
+        help="File suffix to scan; can be provided multiple times",
+    )
+    return parser.parse_args(argv)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    if argv and argv[0] == "compile-passes":
+        args = parse_compile_passes_args(argv[1:])
+        args.command = "compile-passes"
+        return args
+    if argv and argv[0] == "process-file":
+        args = parse_process_file_args(argv[1:])
+        args.command = "process-file"
+        return args
+    if argv and argv[0] == "assemble-pass":
+        args = parse_assemble_pass_args(argv[1:])
+        args.command = "assemble-pass"
+        return args
     if argv and not argv[0].startswith("-"):
         if len(argv) < 3:
             raise ValueError(
                 "Legacy usage: metacodegen.py <shared_dir> <gen_py_dir> <output_root>"
             )
-        return argparse.Namespace(
+        args = argparse.Namespace(
             shared_dir=Path(argv[0]),
             output_root=Path(argv[2]),
             shared_output_root=None,
@@ -1697,6 +2205,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             no_syntax_hints=False,
             source_suffixes=list(DEFAULT_SOURCE_SUFFIXES),
         )
+        args.command = "generate-all"
+        return args
 
     parser = argparse.ArgumentParser(
         description=(
@@ -1751,46 +2261,128 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=list(DEFAULT_SOURCE_SUFFIXES),
         help="File suffix to scan and rewrite; can be provided multiple times",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.command = "generate-all"
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.command == "compile-passes":
+        source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
+        print(f"[codegen] Compile passes: {args.passes_dir}")
+        entries = compile_pass_inventory(
+            args.passes_dir,
+            args.generated_header_root,
+            args.generated_header_prefix,
+            source_suffixes,
+        )
+        remove_stale_pass_artifacts(args.build_root.resolve(), {entry["id"] for entry in entries})
+        for entry in entries:
+            descriptor_path = args.build_root / f"pass_{entry['id']}.json"
+            write_pass_descriptor(descriptor_path, entry)
+        if args.shared_dir is not None and args.output_root is not None:
+            write_public_output_headers(entries, args.output_root.resolve())
+        print(f"[codegen] Compiled {len(entries)} passes")
+        return 0
+    if args.command == "process-file":
+        shared_root = args.shared_root.resolve()
+        input_file = args.input.resolve()
+        build_root = args.build_root.resolve()
+        rel_source_files = [
+            file.relative_to(shared_root)
+            for file in iter_source_files(shared_root, tuple(DEFAULT_SOURCE_SUFFIXES))
+        ]
+        rel_from_shared_parent = input_file.relative_to(shared_root.parent)
+        rel_from_shared_root = input_file.relative_to(shared_root)
+        print(f"[codegen] Process file: {rel_from_shared_root.as_posix()}")
+        loaded_passes = load_pass_defs_from_build_root(build_root)
+        blocks, strip_blocks, source = discover_blocks_in_file(input_file)
+
+        pass_defs = {entry["id"]: pass_def for entry, pass_def in loaded_passes}
+        instances_by_pass = {entry["id"]: [] for entry, _ in loaded_passes}
+
+        for block in blocks:
+            stripped = block.text.lstrip()
+            if stripped.startswith("pass"):
+                block.replacement = ""
+                continue
+
+            pass_id, values = identify_pass(block, pass_defs)
+            instances_by_pass[pass_id].append(values)
+
+        stripped_out = strip_marker_blocks(source, strip_blocks)
+        shared_out_path = args.shared_output_root / rel_from_shared_parent
+        shared_out_path.parent.mkdir(parents=True, exist_ok=True)
+        if write_text_if_changed(shared_out_path, stripped_out):
+            print(f"Written: {shared_out_path}")
+
+        for entry, pass_def in loaded_passes:
+            instances = instances_by_pass[entry["id"]]
+            write_pass_file_shards(
+                entry,
+                pass_def,
+                rel_from_shared_root,
+                instances,
+                args.shared_output_root.resolve(),
+                build_root,
+                rel_source_files,
+            )
+
+        matched_pass_count = sum(1 for instances in instances_by_pass.values() if instances)
+        total_instances = sum(len(instances) for instances in instances_by_pass.values())
+        print(f"[codegen] Matched {total_instances} instances across {matched_pass_count} passes")
+        return 0
+    if args.command == "assemble-pass":
+        entry = load_pass_entry(args.build_root.resolve(), args.pass_id)
+        print(f"[codegen] Assemble pass: {args.pass_id}")
+        source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
+        write_pass_aggregate_headers(
+            [entry],
+            args.shared_root.resolve(),
+            args.output_root.resolve(),
+            source_suffixes,
+        )
+        return 0
+
     shared_dir = args.shared_dir
     output_root = args.output_root
     shared_output_root = args.shared_output_root or output_root
     stamp_path = args.stamp or (output_root / "content.stamp")
     source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
 
+    print(f"[codegen] Scan: {shared_dir}")
     blocks, strip_map = discover_blocks(shared_dir, source_suffixes)
+    print(f"[codegen] Found {len(blocks)} marker blocks in {len(strip_map)} files")
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
     if not pass_blocks:
         raise ValueError(f"No $pass block found under {shared_dir}")
 
+    print(f"[codegen] Compile: {len(pass_blocks)} pass blocks")
     pass_defs: dict[str, PassDef] = {}
     for block in pass_blocks:
         pass_def = compile_pass(block.text, block.file)
-        key = pass_def.name or f"__top_level__:{len([d for d in pass_defs.values() if not d.is_helper])}"
-        if pass_def.name is not None and pass_def.name in pass_defs:
-            raise ValueError(f"Duplicate $pass {pass_def.name}")
+        key = f"__top_level__:{len(pass_defs)}"
         pass_defs[key] = pass_def
         block.replacement = ""
 
-    top_level_defs = {key: pass_def for key, pass_def in pass_defs.items() if not pass_def.is_helper}
-    helper_defs = {key: pass_def for key, pass_def in pass_defs.items() if pass_def.is_helper and pass_def.name}
-    instances_by_pass = {name: [] for name in top_level_defs}
+    local_helper_count = sum(len(pass_def.local_helper_defs) for pass_def in pass_defs.values())
+    instances_by_pass = {name: [] for name in pass_defs}
+    print(f"[codegen] Match: {len(pass_defs)} passes, {local_helper_count} rules")
 
     for block in blocks:
         stripped = block.text.lstrip()
         if stripped.startswith("pass"):
             continue
 
-        pass_name, values = identify_pass(block, top_level_defs)
+        pass_name, values = identify_pass(block, pass_defs)
         instances_by_pass[pass_name].append(values)
 
     output_root.mkdir(parents=True, exist_ok=True)
-    for name, pass_def in top_level_defs.items():
-        fragments = render_fragments(pass_def, instances_by_pass[name], helper_defs)
+    total_instances = sum(len(instances) for instances in instances_by_pass.values())
+    print(f"[codegen] Emit: {total_instances} instances into {len(pass_defs)} output groups")
+    for name, pass_def in pass_defs.items():
+        fragments = render_fragments(pass_def, instances_by_pass[name], pass_def.local_helper_defs)
         folder_name = default_pass_output_name(pass_def, name)
         for fragment_name, content in fragments.items():
             if args.generated_header_root:
@@ -1801,11 +2393,13 @@ def main(argv: list[str] | None = None) -> int:
             out_path.write_text(content)
             print(f"Written: {out_path}")
 
+    print(f"[codegen] Rewrite: stripped shared sources -> {shared_output_root}")
     write_generated_sources(shared_dir, strip_map, shared_output_root, source_suffixes)
     stamp_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_path.write_text("# Generated by codegen\n")
     print(f"Written: {stamp_path}")
     if not args.no_syntax_hints:
+        print("[codegen] Emit: syntax hints")
         syntax_hints_path = args.syntax_hints or (output_root / "syntax_hints.h")
         write_syntax_hints(syntax_hints_path, [pass_def.name for pass_def in pass_defs.values() if pass_def.name])
     return 0
