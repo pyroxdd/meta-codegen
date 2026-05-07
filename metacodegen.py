@@ -150,27 +150,17 @@ def parse_schema_template(schema_body: str, pass_name: str, file: Path) -> list[
     if not source:
         raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
 
-    if re.search(r"<\s*[A-Za-z_]\w*\s*>", source):
-        parts = parse_raw_schema_template(source)
-    else:
-        parts = parse_legacy_schema_template(source, pass_name, file)
+    wrapped = parse_wrapped_schema_literal(source)
+    if wrapped is not None:
+        source = wrapped
+
+    parts = parse_legacy_schema_template(source, pass_name, file)
 
     if not parts:
         raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
 
     compact = compact_schema_parts(parts, pass_name, file)
     return compact
-
-
-def parse_raw_schema_template(source: str) -> list[SchemaPart]:
-    wrapped = parse_wrapped_schema_literal(source)
-    if wrapped is not None:
-        source = wrapped
-
-    parts, end = parse_raw_schema_parts(source, 0, False)
-    if end != len(source):
-        raise ValueError(f"Unexpected trailing schema syntax: {source[end:]!r}")
-    return parts
 
 
 def parse_wrapped_schema_literal(source: str) -> str | None:
@@ -204,72 +194,6 @@ def parse_legacy_schema_template(source: str, pass_name: str, file: Path) -> lis
     if end != len(source):
         raise ValueError(f"Invalid schema syntax in $pass {pass_name} in {file}: {source[end:end+20]!r}")
     return parts
-
-
-def parse_raw_schema_parts(source: str, start: int, in_branch: bool) -> tuple[list[SchemaPart], int]:
-    parts = []
-    literal = []
-    i = start
-
-    while i < len(source):
-        ch = source[i]
-        if ch == "]":
-            if not in_branch:
-                raise ValueError("Unexpected closing ] in schema")
-            break
-        if ch == "|" and in_branch:
-            break
-        if ch == "[":
-            if literal:
-                parts.append(SchemaPart("literal", "".join(literal)))
-                literal = []
-            branch, i = parse_raw_schema_branch(source, i + 1)
-            parts.append(branch)
-            continue
-        if ch == "<":
-            end = source.find(">", i + 1)
-            if end == -1:
-                raise ValueError(f"Unterminated schema capture in {source!r}")
-            name = source[i + 1:end].strip()
-            if not re.fullmatch(r"[A-Za-z_]\w*", name):
-                raise ValueError(f"Invalid schema capture name <{name}>")
-            if literal:
-                parts.append(SchemaPart("literal", "".join(literal)))
-                literal = []
-            i = end + 1
-            if i < len(source) and source[i] == "[":
-                branch, i = parse_raw_schema_branch(source, i + 1, capture_name=name)
-                parts.append(branch)
-                continue
-            parts.append(SchemaPart("capture", name))
-            continue
-        literal.append(ch)
-        i += 1
-
-    if literal:
-        parts.append(SchemaPart("literal", "".join(literal)))
-    return parts, i
-
-
-def parse_raw_schema_branch(source: str, start: int, capture_name: str | None = None) -> tuple[SchemaPart, int]:
-    alternatives = []
-    saw_separator = False
-    i = start
-
-    while True:
-        parts, i = parse_raw_schema_parts(source, i, True)
-        alternatives.append(parts)
-        if i >= len(source):
-            raise ValueError("Unterminated schema branch")
-        if source[i] == "|":
-            saw_separator = True
-            i += 1
-            continue
-        if source[i] == "]":
-            if not saw_separator:
-                raise ValueError("Schema branch must contain '|'")
-            return SchemaPart("branch", alternatives=alternatives, capture_name=capture_name), i + 1
-        raise ValueError(f"Invalid schema branch syntax near {source[i:i+20]!r}")
 
 
 def parse_legacy_schema_parts(
@@ -1051,6 +975,19 @@ def match_schema(source: str, schema: list[SchemaPart], file: Path, pass_name: s
     return values
 
 
+def collect_schema_capture_names(schema: list[SchemaPart]) -> set[str]:
+    names: set[str] = set()
+    for part in schema:
+        if part.kind == "capture" and part.value:
+            names.add(part.value)
+        elif part.kind == "branch":
+            if part.capture_name:
+                names.add(part.capture_name)
+            for alternative in part.alternatives or []:
+                names.update(collect_schema_capture_names(alternative))
+    return names
+
+
 def match_schema_nodes(
     source: str,
     schema: list[SchemaPart],
@@ -1604,7 +1541,7 @@ def split_top_level(expr: str, separator: str) -> list[str]:
 
 def render_template(template: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str:
     rendered = render_expr(template, fields, counters, helper_functions)
-    if rendered:
+    if rendered is not None:
         return rendered
     raise ValueError(f"Invalid instance expression: {template!r}")
 
@@ -1642,9 +1579,11 @@ def execute_instance_ops(
     local_output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
 ) -> None:
-    helper_functions: dict[str, object] = {}
+    helper_functions: dict[str, object] = dict(pass_def.init_vars)
     for op in pass_def.instance_ops:
         if op.kind == "var":
+            if op.alias_name is not None and op.alias_name not in local_output_bindings:
+                local_output_bindings[op.alias_name] = []
             continue
 
         if op.kind == "assign":
@@ -1726,9 +1665,13 @@ def execute_named_pass(
 
     pos = skip_c_whitespace(input_text, 0)
     local_index = 0
+    schema_capture_names = collect_schema_capture_names(pass_def.schema)
 
     while pos < len(input_text):
-        matched = match_schema_nodes(input_text, pass_def.schema, 0, pos, outer_fields.copy(), allow_trailing=True)
+        inherited_fields = outer_fields.copy()
+        for capture_name in schema_capture_names:
+            inherited_fields.pop(capture_name, None)
+        matched = match_schema_nodes(input_text, pass_def.schema, 0, pos, inherited_fields, allow_trailing=True)
         if matched is None:
             snippet = input_text[pos:pos + 40]
             raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
