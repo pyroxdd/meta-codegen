@@ -1021,7 +1021,12 @@ def match_schema_nodes(
                 return matched
         return None
 
-    for capture_end in iter_capture_end_positions(source, pos):
+    if index == len(schema) - 1 and allow_trailing:
+        capture_positions = list(reversed(list(iter_capture_end_positions(source, pos))))
+    else:
+        capture_positions = iter_capture_end_positions(source, pos)
+
+    for capture_end in capture_positions:
         captured = source[pos:capture_end].strip()
         next_values = values.copy()
         next_values[part.value] = captured
@@ -1075,6 +1080,136 @@ def skip_c_whitespace(source: str, start: int) -> int:
         break
 
     return i
+
+
+def match_c_keyword(source: str, start: int, keyword: str) -> bool:
+    end = start + len(keyword)
+    if not source.startswith(keyword, start):
+        return False
+    if start > 0 and (source[start - 1].isalnum() or source[start - 1] == "_"):
+        return False
+    if end < len(source) and (source[end].isalnum() or source[end] == "_"):
+        return False
+    return True
+
+
+def top_level_item_end(source: str, start: int) -> int:
+    brace_depth = 0
+    bracket_depth = 0
+    paren_depth = 0
+    in_string = False
+    in_char = False
+    escaped = False
+    saw_top_level_block = False
+    starts_with_do = source[skip_c_whitespace(source, start):].startswith("do")
+    i = start
+
+    while i < len(source):
+        if not in_string and not in_char:
+            if source.startswith("//", i):
+                i += 2
+                while i < len(source) and source[i] != "\n":
+                    i += 1
+                continue
+            if source.startswith("/*", i):
+                end = source.find("*/", i + 2)
+                if end == -1:
+                    raise ValueError("Unterminated block comment")
+                i = end + 2
+                continue
+
+        ch = source[i]
+
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if in_char:
+            if ch == "\\":
+                escaped = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            i += 1
+            continue
+
+        if ch == "{":
+            brace_depth += 1
+            if brace_depth == 1 and bracket_depth == 0 and paren_depth == 0:
+                saw_top_level_block = True
+            i += 1
+            continue
+        if ch == "}":
+            brace_depth -= 1
+            i += 1
+            if brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
+                probe = skip_c_whitespace(source, i)
+                if probe < len(source) and source[probe] == "{":
+                    i = probe
+                    continue
+                if match_c_keyword(source, probe, "else") or match_c_keyword(source, probe, "catch") or match_c_keyword(source, probe, "finally"):
+                    i = probe
+                    continue
+                if starts_with_do and match_c_keyword(source, probe, "while"):
+                    i = probe
+                    continue
+                if probe < len(source) and source[probe] == ";":
+                    return probe + 1
+                return i
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            i += 1
+            continue
+        if ch == "]":
+            bracket_depth -= 1
+            i += 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            paren_depth -= 1
+            i += 1
+            continue
+
+        if brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
+            if ch == ";":
+                return i + 1
+            if saw_top_level_block and not ch.isspace():
+                return i
+
+        i += 1
+
+    return i
+
+
+def iter_top_level_items(source: str):
+    pos = skip_c_whitespace(source, 0)
+    while pos < len(source):
+        end = top_level_item_end(source, pos)
+        if end <= pos:
+            raise ValueError("Top-level item parser made no progress")
+        yield source[pos:end].strip()
+        pos = skip_c_whitespace(source, end)
 
 
 def iter_capture_end_positions(source: str, start: int):
@@ -1580,9 +1715,16 @@ def execute_instance_ops(
     global_accs: dict[str, list[str]],
 ) -> None:
     helper_functions: dict[str, object] = dict(pass_def.init_vars)
+
+    def template_fields() -> dict[str, str]:
+        scoped = fields.copy()
+        for alias_name, sink in local_output_bindings.items():
+            scoped[alias_name] = "".join(sink)
+        return scoped
+
     for op in pass_def.instance_ops:
         if op.kind == "var":
-            if op.alias_name is not None and op.alias_name not in local_output_bindings:
+            if op.alias_name is not None:
                 local_output_bindings[op.alias_name] = []
             continue
 
@@ -1595,7 +1737,7 @@ def execute_instance_ops(
         if op.kind == "emit":
             if op.target is None or op.template is None:
                 continue
-            rendered = render_template(op.template, fields, counters, helper_functions)
+            rendered = render_template(op.template, template_fields(), counters, helper_functions)
             sink = resolve_output_sink(op.target, local_output_bindings, global_accs)
             sink.append(rendered)
             continue
@@ -1610,7 +1752,7 @@ def execute_instance_ops(
                 raise ValueError(
                     f"Helper pass {op.helper_name} expects {len(helper_def.output_params)} outputs, got {len(op.output_targets)}"
                 )
-            input_text = render_template(op.input_expr, fields, counters, helper_functions)
+            input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
             bound_outputs = {
                 param: resolve_output_sink(target, local_output_bindings, global_accs)
                 for param, target in zip(helper_def.output_params, op.output_targets)
@@ -1621,7 +1763,12 @@ def execute_instance_ops(
         if op.kind == "if":
             if op.condition_field is None or op.condition_op is None or op.condition_value is None:
                 continue
-            matches = fields.get(op.condition_field, "") == op.condition_value
+            field_value = fields.get(op.condition_field)
+            if field_value is None and op.condition_field in local_output_bindings:
+                field_value = "".join(local_output_bindings[op.condition_field])
+            if field_value is None:
+                field_value = ""
+            matches = field_value == op.condition_value
             if op.condition_op == "!=":
                 matches = not matches
             branch_ops = op.true_ops if matches else op.false_ops
@@ -1663,29 +1810,26 @@ def execute_named_pass(
         else:
             state[key] = value
 
-    pos = skip_c_whitespace(input_text, 0)
     local_index = 0
     schema_capture_names = collect_schema_capture_names(pass_def.schema)
 
-    while pos < len(input_text):
+    for item_text in iter_top_level_items(input_text):
         inherited_fields = outer_fields.copy()
         for capture_name in schema_capture_names:
             inherited_fields.pop(capture_name, None)
-        matched = match_schema_nodes(input_text, pass_def.schema, 0, pos, inherited_fields, allow_trailing=True)
+        matched = match_schema_nodes(item_text, pass_def.schema, 0, 0, inherited_fields, allow_trailing=True)
         if matched is None:
-            snippet = input_text[pos:pos + 40]
+            snippet = item_text[:40]
             raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
 
         end, fields = matched
-        if end <= pos:
+        if end <= 0:
             raise ValueError(f"Helper pass {pass_def.name} made no progress")
 
         counters = copy.deepcopy(state)
         counters.update(outer_counters)
         counters["index"] = local_index
         execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs)
-
-        pos = skip_c_whitespace(input_text, end)
         local_index += 1
 
 
