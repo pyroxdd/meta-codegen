@@ -65,6 +65,10 @@ class SchemaPart:
     capture_name: str | None = None
 
 
+TRUTHY_DEFINE_VALUES = {"1", "true", "yes", "on"}
+FALSY_DEFINE_VALUES = {"", "0", "false", "no", "off"}
+
+
 class SymbolicExpr:
     def __init__(self, expr: str):
         self.expr = expr
@@ -91,6 +95,159 @@ class SymbolicExpr:
 
     def __rsub__(self, other):
         return SymbolicExpr(f"({self._coerce(other)} - {self.expr})")
+
+
+def parse_define_args(values: list[str]) -> dict[str, str]:
+    defines: dict[str, str] = {}
+    for raw_value in values:
+        text = raw_value.strip()
+        if not text:
+            continue
+        if "=" in text:
+            name, value = text.split("=", 1)
+        else:
+            name, value = text, "1"
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+            raise ValueError(f"Invalid define name: {raw_value!r}")
+        defines[name] = value.strip()
+    return defines
+
+
+def serialize_defines(defines: dict[str, str]) -> list[str]:
+    return [f"{name}={value}" for name, value in sorted(defines.items())]
+
+
+def is_truthy_define_value(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in TRUTHY_DEFINE_VALUES:
+        return True
+    if normalized in FALSY_DEFINE_VALUES:
+        return False
+    return True
+
+
+def eval_preprocessor_expr(expr: str, defines: dict[str, str], file: Path, line_no: int) -> bool:
+    expr = expr.strip()
+    if not expr:
+        raise ValueError(f"Empty #if expression in {file}:{line_no}")
+
+    defined_match = re.fullmatch(r"(!?)defined\s*\(\s*([A-Za-z_]\w*)\s*\)", expr)
+    if defined_match is not None:
+        negate, name = defined_match.groups()
+        result = name in defines
+        return not result if negate else result
+
+    ident_match = re.fullmatch(r"(!?)([A-Za-z_]\w*)", expr)
+    if ident_match is not None:
+        negate, name = ident_match.groups()
+        result = is_truthy_define_value(defines.get(name))
+        return not result if negate else result
+
+    literal_match = re.fullmatch(r"(!?)(0|1|true|false)", expr, re.IGNORECASE)
+    if literal_match is not None:
+        negate, literal = literal_match.groups()
+        result = literal.lower() in {"1", "true"}
+        return not result if negate else result
+
+    raise ValueError(f"Unsupported preprocessor expression {expr!r} in {file}:{line_no}")
+
+
+def preprocess_pass_text(source: str, defines: dict[str, str], file: Path) -> str:
+    if "#" not in source:
+        return source
+
+    directive_re = re.compile(r"^([ \t]*)#(ifdef|ifndef|if|elifdef|elifndef|elif|else|endif)\b(.*)$")
+    lines = source.splitlines(keepends=True)
+    output: list[str] = []
+    stack: list[dict[str, bool]] = []
+
+    for line_index, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("##"):
+            if all(frame["active"] for frame in stack):
+                output.append(line)
+            continue
+
+        match = directive_re.match(line)
+        if match is None:
+            if all(frame["active"] for frame in stack):
+                output.append(line)
+            else:
+                newline = "\n" if line.endswith("\n") else ""
+                output.append(newline)
+            continue
+
+        _, directive, remainder = match.groups()
+        remainder = remainder.strip()
+
+        if directive in {"ifdef", "ifndef", "if"}:
+            if directive == "ifdef":
+                if not re.fullmatch(r"[A-Za-z_]\w*", remainder):
+                    raise ValueError(f"Invalid #ifdef name {remainder!r} in {file}:{line_index}")
+                condition = remainder in defines
+            elif directive == "ifndef":
+                if not re.fullmatch(r"[A-Za-z_]\w*", remainder):
+                    raise ValueError(f"Invalid #ifndef name {remainder!r} in {file}:{line_index}")
+                condition = remainder not in defines
+            else:
+                condition = eval_preprocessor_expr(remainder, defines, file, line_index)
+
+            parent_active = all(frame["active"] for frame in stack)
+            stack.append({
+                "parent_active": parent_active,
+                "active": parent_active and condition,
+                "branch_taken": condition,
+            })
+            output.append("\n" if line.endswith("\n") else "")
+            continue
+
+        if not stack:
+            raise ValueError(f"Unexpected #{directive} without matching #if in {file}:{line_index}")
+
+        frame = stack[-1]
+        parent_active = frame["parent_active"]
+
+        if directive in {"elifdef", "elifndef", "elif"}:
+            if frame["branch_taken"]:
+                frame["active"] = False
+            else:
+                if directive == "elifdef":
+                    if not re.fullmatch(r"[A-Za-z_]\w*", remainder):
+                        raise ValueError(f"Invalid #elifdef name {remainder!r} in {file}:{line_index}")
+                    condition = remainder in defines
+                elif directive == "elifndef":
+                    if not re.fullmatch(r"[A-Za-z_]\w*", remainder):
+                        raise ValueError(f"Invalid #elifndef name {remainder!r} in {file}:{line_index}")
+                    condition = remainder not in defines
+                else:
+                    condition = eval_preprocessor_expr(remainder, defines, file, line_index)
+                frame["active"] = parent_active and condition
+                frame["branch_taken"] = condition
+            output.append("\n" if line.endswith("\n") else "")
+            continue
+
+        if directive == "else":
+            if remainder:
+                raise ValueError(f"#else does not accept a condition in {file}:{line_index}")
+            frame["active"] = parent_active and not frame["branch_taken"]
+            frame["branch_taken"] = True
+            output.append("\n" if line.endswith("\n") else "")
+            continue
+
+        if directive == "endif":
+            if remainder:
+                raise ValueError(f"#endif does not accept trailing tokens in {file}:{line_index}")
+            stack.pop()
+            output.append("\n" if line.endswith("\n") else "")
+            continue
+
+    if stack:
+        raise ValueError(f"Unterminated preprocessor block in {file}")
+
+    return "".join(output)
 
 
 def parse_pass_file(source: str) -> dict[str, str]:
@@ -937,6 +1094,22 @@ def discover_blocks(
     return blocks, strip_blocks
 
 
+def collect_instances_by_pass(
+    shared_dir: Path,
+    pass_defs: dict[str, PassDef],
+    source_suffixes: tuple[str, ...],
+) -> dict[str, list[dict[str, str]]]:
+    instances_by_pass = {name: [] for name in pass_defs}
+    blocks, _ = discover_blocks(shared_dir, source_suffixes)
+    for block in blocks:
+        stripped = block.text.lstrip()
+        if stripped.startswith("pass"):
+            continue
+        pass_id, values = identify_pass(block, pass_defs)
+        instances_by_pass[pass_id].append(values)
+    return instances_by_pass
+
+
 def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
     return match_schema(block.text.strip(), pass_def.schema, block.file, pass_def.name)
 
@@ -1713,6 +1886,7 @@ def execute_instance_ops(
     helper_defs: dict[str, PassDef],
     local_output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
+    global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
 ) -> None:
     helper_functions: dict[str, object] = dict(pass_def.init_vars)
 
@@ -1752,12 +1926,39 @@ def execute_instance_ops(
                 raise ValueError(
                     f"Helper pass {op.helper_name} expects {len(helper_def.output_params)} outputs, got {len(op.output_targets)}"
                 )
-            input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
             bound_outputs = {
                 param: resolve_output_sink(target, local_output_bindings, global_accs)
                 for param, target in zip(helper_def.output_params, op.output_targets)
             }
-            execute_named_pass(helper_def, input_text, fields, counters, helper_defs, bound_outputs, global_accs)
+            if op.input_expr.startswith("@pass:"):
+                pass_id = op.input_expr[len("@pass:"):].strip()
+                if global_pass_instances is None:
+                    raise ValueError(f"Global pass instances are not available for helper pass {op.helper_name}")
+                source_instances = global_pass_instances.get(pass_id)
+                if source_instances is None:
+                    raise ValueError(f"Unknown global pass id {pass_id!r} for helper pass {op.helper_name}")
+                execute_pass_instance_helper(
+                    helper_def,
+                    source_instances,
+                    fields,
+                    counters,
+                    helper_defs,
+                    bound_outputs,
+                    global_accs,
+                    global_pass_instances,
+                )
+            else:
+                input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
+                execute_named_pass(
+                    helper_def,
+                    input_text,
+                    fields,
+                    counters,
+                    helper_defs,
+                    bound_outputs,
+                    global_accs,
+                    global_pass_instances,
+                )
             continue
 
         if op.kind == "if":
@@ -1784,7 +1985,15 @@ def execute_instance_ops(
                     is_helper=pass_def.is_helper,
                     local_helper_defs=pass_def.local_helper_defs,
                 )
-                execute_instance_ops(nested_pass, fields, counters, helper_defs, local_output_bindings, global_accs)
+                execute_instance_ops(
+                    nested_pass,
+                    fields,
+                    counters,
+                    helper_defs,
+                    local_output_bindings,
+                    global_accs,
+                    global_pass_instances,
+                )
             continue
 
         raise ValueError(f"Unsupported instance op kind {op.kind!r}")
@@ -1798,6 +2007,7 @@ def execute_named_pass(
     helper_defs: dict[str, PassDef],
     output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
+    global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
 ) -> None:
     import copy
 
@@ -1829,8 +2039,38 @@ def execute_named_pass(
         counters = copy.deepcopy(state)
         counters.update(outer_counters)
         counters["index"] = local_index
-        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs, global_pass_instances)
         local_index += 1
+
+
+def execute_pass_instance_helper(
+    pass_def: PassDef,
+    source_instances: list[dict[str, str]],
+    outer_fields: dict[str, str],
+    outer_counters: dict,
+    helper_defs: dict[str, PassDef],
+    output_bindings: dict[str, list[str]],
+    global_accs: dict[str, list[str]],
+    global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
+) -> None:
+    import copy
+
+    state = {}
+    for key, value in pass_def.init_vars.items():
+        if isinstance(value, list):
+            continue
+        if isinstance(value, (dict, set, tuple)):
+            state[key] = copy.deepcopy(value)
+        else:
+            state[key] = value
+
+    for local_index, instance_fields in enumerate(source_instances):
+        fields = outer_fields.copy()
+        fields.update(instance_fields)
+        counters = copy.deepcopy(state)
+        counters.update(outer_counters)
+        counters["index"] = local_index
+        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs, global_pass_instances)
 
 
 def render_fragments(
@@ -1838,6 +2078,7 @@ def render_fragments(
     instances: list[dict[str, str]],
     helper_defs: dict[str, PassDef],
     index_base_expr: str | None = None,
+    global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
 ) -> dict[str, str]:
     import copy
 
@@ -1863,7 +2104,7 @@ def render_fragments(
             counters["index"] = SymbolicExpr(index_base_expr)
         else:
             counters["index"] = SymbolicExpr(f"({index_base_expr} + {index})")
-        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs, global_pass_instances)
 
     fragments = {}
     for key, value in accs.items():
@@ -1925,6 +2166,7 @@ def compile_pass_inventory(
     generated_header_root: str,
     generated_header_prefix: str,
     source_suffixes: tuple[str, ...],
+    defines: dict[str, str],
 ) -> list[dict]:
     blocks, _ = discover_blocks(passes_dir, source_suffixes)
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
@@ -1941,7 +2183,7 @@ def compile_pass_inventory(
 
     inventory: list[dict] = []
     for block in pass_blocks:
-        pass_def = compile_pass(block.text, block.file)
+        pass_def = compile_pass(preprocess_pass_text(block.text, defines, block.file), block.file)
         rel_file = block.file.relative_to(passes_dir)
         pass_name = sanitize_path_token(rel_file.stem)
         pass_id = pass_name
@@ -1960,6 +2202,7 @@ def compile_pass_inventory(
             "folder": pass_name,
             "outputs": outputs,
             "pass_text": block.text.strip(),
+            "defines": serialize_defines(defines),
             "rule_count": len(pass_def.local_helper_defs),
         })
 
@@ -1985,6 +2228,7 @@ def write_pass_descriptor(out_path: Path, entry: dict) -> None:
         "folder": entry["folder"],
         "outputs": entry["outputs"],
         "pass_text": entry["pass_text"],
+        "defines": entry.get("defines", []),
         "rule_count": entry["rule_count"],
         "counts": existing_counts,
     }
@@ -2032,7 +2276,9 @@ def load_pass_defs_from_build_root(build_root: Path) -> list[tuple[dict, PassDef
         source_file = entry.get("source_file")
         if not pass_text:
             raise ValueError(f"Pass descriptor {entry.get('id', '<unknown>')} does not define pass_text")
-        pass_def = compile_pass(pass_text, Path(source_file))
+        defines = parse_define_args(entry.get("defines", []))
+        preprocessed_pass_text = preprocess_pass_text(pass_text, defines, Path(source_file))
+        pass_def = compile_pass(preprocessed_pass_text, Path(source_file))
         loaded.append((entry, pass_def))
     return loaded
 
@@ -2102,6 +2348,7 @@ def write_pass_file_shards(
     output_root: Path,
     build_root: Path,
     rel_source_files: list[Path],
+    global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
 ) -> list[Path]:
     fragment_names = collect_declared_output_targets(pass_def.instance_ops)
     written_paths: list[Path] = []
@@ -2117,6 +2364,7 @@ def write_pass_file_shards(
         instances,
         pass_def.local_helper_defs,
         str(index_base),
+        global_pass_instances,
     )
 
     for rel_output, fragment_name in zip(outputs, fragment_names):
@@ -2231,6 +2479,13 @@ def parse_compile_passes_args(argv: list[str]) -> argparse.Namespace:
         default=list(DEFAULT_SOURCE_SUFFIXES),
         help="File suffix to scan; can be provided multiple times",
     )
+    parser.add_argument(
+        "--define",
+        dest="defines",
+        action="append",
+        default=[],
+        help="Boolean or valued define made available to pass preprocessing, e.g. NAME or NAME=1",
+    )
     return parser.parse_args(argv)
 
 
@@ -2242,6 +2497,13 @@ def parse_process_file_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--input", required=True, type=Path, help="Source file to process")
     parser.add_argument("--shared-root", required=True, type=Path, help="Root directory of shared source files")
     parser.add_argument("--shared-output-root", required=True, type=Path, help="Output root for stripped shared files")
+    parser.add_argument(
+        "--define",
+        dest="defines",
+        action="append",
+        default=[],
+        help="Accepted for CLI symmetry; pass descriptors remain the source of truth",
+    )
     return parser.parse_args(argv)
 
 
@@ -2259,6 +2521,13 @@ def parse_assemble_pass_args(argv: list[str]) -> argparse.Namespace:
         action="append",
         default=list(DEFAULT_SOURCE_SUFFIXES),
         help="File suffix to scan; can be provided multiple times",
+    )
+    parser.add_argument(
+        "--define",
+        dest="defines",
+        action="append",
+        default=[],
+        help="Accepted for CLI symmetry; pass descriptors remain the source of truth",
     )
     return parser.parse_args(argv)
 
@@ -2348,6 +2617,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=list(DEFAULT_SOURCE_SUFFIXES),
         help="File suffix to scan and rewrite; can be provided multiple times",
     )
+    parser.add_argument(
+        "--define",
+        dest="defines",
+        action="append",
+        default=[],
+        help="Boolean or valued define made available to pass preprocessing, e.g. NAME or NAME=1",
+    )
     args = parser.parse_args(argv)
     args.command = "generate-all"
     return args
@@ -2355,6 +2631,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    define_map = parse_define_args(getattr(args, "defines", []))
     if args.command == "compile-passes":
         source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
         print(f"[codegen] Compile passes: {args.passes_dir}")
@@ -2363,6 +2640,7 @@ def main(argv: list[str] | None = None) -> int:
             args.generated_header_root,
             args.generated_header_prefix,
             source_suffixes,
+            define_map,
         )
         remove_stale_pass_artifacts(args.build_root.resolve(), {entry["id"] for entry in entries})
         for entry in entries:
@@ -2387,6 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
         blocks, strip_blocks, source = discover_blocks_in_file(input_file)
 
         pass_defs = {entry["id"]: pass_def for entry, pass_def in loaded_passes}
+        global_instances_by_pass = collect_instances_by_pass(shared_root, pass_defs, tuple(DEFAULT_SOURCE_SUFFIXES))
         instances_by_pass = {entry["id"]: [] for entry, _ in loaded_passes}
 
         for block in blocks:
@@ -2414,6 +2693,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.shared_output_root.resolve(),
                 build_root,
                 rel_source_files,
+                global_instances_by_pass,
             )
 
         matched_pass_count = sum(1 for instances in instances_by_pass.values() if instances)
@@ -2448,7 +2728,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[codegen] Compile: {len(pass_blocks)} pass blocks")
     pass_defs: dict[str, PassDef] = {}
     for block in pass_blocks:
-        pass_def = compile_pass(block.text, block.file)
+        preprocessed_pass_text = preprocess_pass_text(block.text, define_map, block.file)
+        pass_def = compile_pass(preprocessed_pass_text, block.file)
         key = f"__top_level__:{len(pass_defs)}"
         pass_defs[key] = pass_def
         block.replacement = ""
@@ -2457,19 +2738,15 @@ def main(argv: list[str] | None = None) -> int:
     instances_by_pass = {name: [] for name in pass_defs}
     print(f"[codegen] Match: {len(pass_defs)} passes, {local_helper_count} rules")
 
-    for block in blocks:
-        stripped = block.text.lstrip()
-        if stripped.startswith("pass"):
-            continue
-
-        pass_name, values = identify_pass(block, pass_defs)
-        instances_by_pass[pass_name].append(values)
+    global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes)
+    for pass_name, values in global_instances_by_pass.items():
+        instances_by_pass[pass_name].extend(values)
 
     output_root.mkdir(parents=True, exist_ok=True)
     total_instances = sum(len(instances) for instances in instances_by_pass.values())
     print(f"[codegen] Emit: {total_instances} instances into {len(pass_defs)} output groups")
     for name, pass_def in pass_defs.items():
-        fragments = render_fragments(pass_def, instances_by_pass[name], pass_def.local_helper_defs)
+        fragments = render_fragments(pass_def, instances_by_pass[name], pass_def.local_helper_defs, global_pass_instances=global_instances_by_pass)
         folder_name = default_pass_output_name(pass_def, name)
         for fragment_name, content in fragments.items():
             if args.generated_header_root:
