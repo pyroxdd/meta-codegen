@@ -1151,7 +1151,7 @@ def match_schema_nodes(
                 continue
             alternative_end, alternative_values = matched_alternative
             if part.capture_name:
-                alternative_values[part.capture_name] = source[pos:alternative_end].strip()
+                alternative_values[part.capture_name] = source[pos:alternative_end]
             matched = match_schema_nodes(source, schema, index + 1, alternative_end, alternative_values, allow_trailing)
             if matched is not None:
                 return matched
