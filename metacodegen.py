@@ -1701,6 +1701,32 @@ def find_top_level(expr: str, needle: str, start: int = 0) -> int | None:
 
 
 def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
+    def find_call_end(source: str, open_index: int) -> int | None:
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for idx in range(open_index, len(source)):
+            ch = source[idx]
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx + 1
+        return None
+
     pieces = []
     i = 0
     saw_token = False
@@ -1738,7 +1764,7 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, he
             saw_token = True
             continue
 
-        m = re.match(r'[A-Za-z_]\w*(?:\+\+)?', expr[i:])
+        m = re.match(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\+\+)?', expr[i:])
         if not m:
             return None
 
@@ -1747,6 +1773,28 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, he
             token += "++"
         if token.endswith("++"):
             pieces.append(render_expr(token, fields, counters, helper_functions))
+            i += len(token)
+            saw_token = True
+            continue
+
+        token_end = i + len(token)
+        if token_end < len(expr) and expr[token_end] == "(":
+            call_end = find_call_end(expr, token_end)
+            if call_end is None:
+                return None
+            value = render_python_expr(expr[i:call_end], fields, counters, helper_functions)
+            if value is None:
+                return None
+            pieces.append(value)
+            i = call_end
+            saw_token = True
+            continue
+
+        if "." in token:
+            value = render_python_expr(token, fields, counters, helper_functions)
+            if value is None:
+                return None
+            pieces.append(value)
         else:
             value = render_variable(token, fields, counters, helper_functions)
             if value is None:
