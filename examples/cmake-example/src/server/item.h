@@ -2,7 +2,6 @@
 
 struct item {
     int index;
-#include "g/item_decls.h"
 };
 
 #include "g/items.h"

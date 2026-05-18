@@ -256,7 +256,7 @@ def parse_pass_file(source: str) -> dict[str, str]:
         section_name = legacy_section_match.group(1)
         raise ValueError(
             f"Deprecated {section_name}() section syntax is no longer supported; "
-            f"use `{section_name} {{ ... }}` or the compact `$pass {{ schema }} {{ instance }}` form instead"
+            f"use `{section_name} {{ ... }}` inside the surrounding pass or rule block instead"
         )
 
     section_re = re.compile(
@@ -302,7 +302,12 @@ def unwrap_section_body(body: str) -> str:
     return "\n".join(lines)
 
 
-def parse_schema_template(schema_body: str, pass_name: str, file: Path) -> list[SchemaPart]:
+def parse_schema_template(
+    schema_body: str,
+    pass_name: str,
+    file: Path,
+    init_vars: dict[str, object] | None = None,
+) -> list[SchemaPart]:
     source = textwrap.dedent(schema_body).strip()
     if not source:
         raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
@@ -311,7 +316,7 @@ def parse_schema_template(schema_body: str, pass_name: str, file: Path) -> list[
     if wrapped is not None:
         source = wrapped
 
-    parts = parse_legacy_schema_template(source, pass_name, file)
+    parts = parse_legacy_schema_template(source, pass_name, file, init_vars)
 
     if not parts:
         raise ValueError(f"$pass {pass_name} has an empty schema block in {file}")
@@ -346,11 +351,25 @@ def parse_wrapped_schema_literal(source: str) -> str | None:
     return "".join(value)
 
 
-def parse_legacy_schema_template(source: str, pass_name: str, file: Path) -> list[SchemaPart]:
-    parts, end = parse_legacy_schema_parts(source, 0, False, pass_name, file)
+def parse_legacy_schema_template(
+    source: str,
+    pass_name: str,
+    file: Path,
+    init_vars: dict[str, object] | None = None,
+) -> list[SchemaPart]:
+    parts, end = parse_legacy_schema_parts(source, 0, False, pass_name, file, init_vars)
     if end != len(source):
         raise ValueError(f"Invalid schema syntax in $pass {pass_name} in {file}: {source[end:end+20]!r}")
     return parts
+
+
+def schema_literal_var_value(name: str, init_vars: dict[str, object] | None) -> str | None:
+    if not init_vars or name not in init_vars:
+        return None
+    value = init_vars[name]
+    if isinstance(value, str):
+        return value
+    return None
 
 
 def parse_legacy_schema_parts(
@@ -359,6 +378,7 @@ def parse_legacy_schema_parts(
     in_branch: bool,
     pass_name: str,
     file: Path,
+    init_vars: dict[str, object] | None = None,
 ) -> tuple[list[SchemaPart], int]:
     parts = []
     i = start
@@ -389,8 +409,12 @@ def parse_legacy_schema_parts(
             name = ident.group(0)
             i += len(name)
             if i < len(source) and source[i] == "[":
-                branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, capture_name=name)
+                branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, init_vars, capture_name=name)
                 parts.append(branch)
+                continue
+            literal_value = schema_literal_var_value(name, init_vars)
+            if literal_value is not None:
+                parts.append(SchemaPart("literal", literal_value))
                 continue
             parts.append(SchemaPart("capture", name))
             continue
@@ -404,6 +428,7 @@ def parse_legacy_schema_branch(
     start: int,
     pass_name: str,
     file: Path,
+    init_vars: dict[str, object] | None = None,
     capture_name: str | None = None,
 ) -> tuple[SchemaPart, int]:
     alternatives = []
@@ -411,7 +436,7 @@ def parse_legacy_schema_branch(
     i = start
 
     while True:
-        parts, i = parse_legacy_schema_parts(source, i, True, pass_name, file)
+        parts, i = parse_legacy_schema_parts(source, i, True, pass_name, file, init_vars)
         alternatives.append(parts)
         if i >= len(source):
             raise ValueError(f"Unterminated schema branch in $pass {pass_name} in {file}")
@@ -756,123 +781,57 @@ def extract_top_level_named_blocks(source: str, keyword: str) -> tuple[str, list
     return "".join(parts), extracted
 
 
-def parse_compact_pass_sections(pass_text: str, file: Path) -> tuple[str, str]:
-    stripped = pass_text.strip()
-    header_match = re.match(r"pass\s*\{", stripped)
+def parse_legacy_two_block_sections(block_text: str, keyword: str) -> tuple[str, str] | None:
+    stripped = block_text.strip()
+    header_match = re.match(rf"{re.escape(keyword)}(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{{", stripped)
     if header_match is None:
-        raise ValueError(f"Expected compact pass syntax in {file}")
+        return None
 
-    parse_pass_header(stripped[:header_match.end() - 1].strip(), file)
-    schema_open = stripped.find("{", header_match.start(), header_match.end())
-    schema_close = matching_brace(stripped, schema_open)
-    if schema_close is None:
-        raise ValueError(f"Compact pass in {file} has an unterminated schema block")
-    schema_body = stripped[schema_open + 1:schema_close].strip()
+    first_open = stripped.find("{", header_match.start(), header_match.end())
+    first_close = matching_brace(stripped, first_open)
+    if first_close is None:
+        return None
 
-    instance_open = skip_c_whitespace(stripped, schema_close + 1)
-    if instance_open >= len(stripped) or stripped[instance_open] != "{":
-        raise ValueError(f"Compact pass in {file} is missing instance block")
-    instance_close = matching_brace(stripped, instance_open)
-    if instance_close is None:
-        raise ValueError(f"Compact pass in {file} has an unterminated instance block")
-    instance_body = stripped[instance_open + 1:instance_close].strip()
+    second_open = skip_c_whitespace(stripped, first_close + 1)
+    if second_open >= len(stripped) or stripped[second_open] != "{":
+        return None
 
-    trailing = stripped[instance_close + 1:].strip()
+    second_close = matching_brace(stripped, second_open)
+    if second_close is None:
+        return None
+
+    trailing = stripped[second_close + 1:].strip()
     if trailing not in ("", ";"):
-        raise ValueError(f"Unexpected trailing pass syntax in {file}: {trailing!r}")
+        return None
 
-    return schema_body, instance_body
-
-
-def normalize_compact_python(python_text: str) -> str:
-    lines = python_text.splitlines()
-    if not lines:
-        return ""
-
-    normalized = [lines[0].lstrip()]
-    indents = [
-        len(line) - len(line.lstrip())
-        for line in lines[1:]
-        if line.strip()
-    ]
-    trim = min(indents) if indents else 0
-    for line in lines[1:]:
-        if trim and len(line) >= trim:
-            normalized.append(line[trim:])
-        else:
-            normalized.append(line)
-    return "\n".join(normalized).strip()
-
-
-def split_compact_schema_block(block_body: str, pass_name: str | None, file: Path) -> tuple[str, str]:
-    lines = block_body.splitlines()
-    if not lines:
-        raise ValueError(f"Compact pass in {file} has an empty schema block")
-
-    candidates = []
-    for split_index in range(len(lines) + 1):
-        python_text = "\n".join(lines[:split_index]).strip()
-        schema_text = "\n".join(lines[split_index:]).strip()
-        if not schema_text:
-            continue
-
-        try:
-            parse_schema_template(schema_text, pass_name, file)
-        except ValueError:
-            continue
-
-        if python_text:
-            try:
-                compile(normalize_compact_python(python_text), str(file), "exec")
-            except SyntaxError:
-                continue
-
-        candidates.append((normalize_compact_python(python_text), schema_text))
-
-    if not candidates:
-        raise ValueError(f"Compact pass in {file} does not contain a valid schema block")
-
-    return candidates[-1]
+    return (
+        stripped[first_open + 1:first_close].strip(),
+        stripped[second_open + 1:second_close].strip(),
+    )
 
 
 def compile_rule(rule_text: str, file: Path) -> PassDef:
     stripped_rule = rule_text.strip()
-    compact_match = re.match(r"rule(?:[ \t]+\w+(?:\([^)]*\))?)?\s*\{", stripped_rule)
-    if compact_match is not None and "schema" not in stripped_rule and "instance" not in stripped_rule:
-        name, output_params = parse_named_block_header(stripped_rule[:compact_match.end() - 1].strip(), file, "rule")
-        schema_open = stripped_rule.find("{", compact_match.start(), compact_match.end())
-        schema_close = matching_brace(stripped_rule, schema_open)
-        if schema_close is None:
-            raise ValueError(f"Compact rule in {file} has an unterminated schema block")
-        first_block_body = stripped_rule[schema_open + 1:schema_close].strip()
+    legacy_sections = parse_legacy_two_block_sections(stripped_rule, "rule")
+    if legacy_sections is not None:
+        raise ValueError(
+            f"Legacy two-block rule syntax is no longer supported in {file}; "
+            f"use `rule <name>(...) {{ ... schema {{ ... }} instance {{ ... }} }}` instead"
+        )
 
-        instance_open = skip_c_whitespace(stripped_rule, schema_close + 1)
-        if instance_open >= len(stripped_rule) or stripped_rule[instance_open] != "{":
-            raise ValueError(f"Compact rule in {file} is missing instance block")
-        instance_close = matching_brace(stripped_rule, instance_open)
-        if instance_close is None:
-            raise ValueError(f"Compact rule in {file} has an unterminated instance block")
-        instance_body = stripped_rule[instance_open + 1:instance_close].strip()
-
-        trailing = stripped_rule[instance_close + 1:].strip()
-        if trailing not in ("", ";"):
-            raise ValueError(f"Unexpected trailing rule syntax in {file}: {trailing!r}")
-        raw_python, schema_body = split_compact_schema_block(first_block_body, name, file)
-        sections = {"python": raw_python, "schema": schema_body, "instance": instance_body}
-    else:
-        unwrapped = unwrap_pass_block(re.sub(r"^\s*rule\b", "pass", stripped_rule, count=1))
-        lines = unwrapped.lstrip().splitlines()
-        first_line = lines[0].strip()
-        name, output_params = parse_named_block_header(first_line.replace("pass", "rule", 1), file, "rule")
-        rebuilt_rule_text = first_line
-        body_text = "\n".join(lines[1:])
-        if body_text:
-            rebuilt_rule_text += "\n" + body_text
-        sections = parse_pass_file(rebuilt_rule_text)
-        missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
-        if missing:
-            raise ValueError(f"rule {name or '<unnamed>'} is missing section(s): {', '.join(missing)}")
-        raw_python = sections.get("python", "")
+    unwrapped = unwrap_pass_block(re.sub(r"^\s*rule\b", "pass", stripped_rule, count=1))
+    lines = unwrapped.lstrip().splitlines()
+    first_line = lines[0].strip()
+    name, output_params = parse_named_block_header(first_line.replace("pass", "rule", 1), file, "rule")
+    rebuilt_rule_text = first_line
+    body_text = "\n".join(lines[1:])
+    if body_text:
+        rebuilt_rule_text += "\n" + body_text
+    sections = parse_pass_file(rebuilt_rule_text)
+    missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
+    if missing:
+        raise ValueError(f"rule {name or '<unnamed>'} is missing section(s): {', '.join(missing)}")
+    raw_python = sections.get("python", "")
 
     if name is None:
         raise ValueError(f"rule in {file} must declare a name")
@@ -896,11 +855,13 @@ def compile_rule(rule_text: str, file: Path) -> PassDef:
                     f"rule {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
                 )
 
+    init_vars = run_init_python(raw_python, file)
+
     return PassDef(
         name=name,
         block_keyword=name,
-        schema=parse_schema_template(sections["schema"], name, file),
-        init_vars=run_init_python(raw_python, file),
+        schema=parse_schema_template(sections["schema"], name, file, init_vars),
+        init_vars=init_vars,
         output_params=output_params,
         instance_targets=[],
         instance_ops=instance_ops,
@@ -910,35 +871,35 @@ def compile_rule(rule_text: str, file: Path) -> PassDef:
 
 def compile_pass(pass_text: str, file: Path) -> PassDef:
     stripped_pass = pass_text.strip()
-    compact_match = re.match(r"pass\s*\{", stripped_pass)
     local_helper_defs: dict[str, PassDef] = {}
-    if compact_match is not None and "schema" not in stripped_pass and "instance" not in stripped_pass:
-        first_block_body, instance_body = parse_compact_pass_sections(stripped_pass, file)
-        output_params, _ = parse_pass_header(stripped_pass[:compact_match.end() - 1].strip(), file)
-        raw_python, schema_body = split_compact_schema_block(first_block_body, None, file)
-        sections = {"python": raw_python, "schema": schema_body, "instance": instance_body}
-    else:
-        pass_text = unwrap_pass_block(pass_text)
-        lines = pass_text.lstrip().splitlines()
-        first_line = lines[0].strip()
-        output_params, has_outputs = parse_pass_header(first_line, file)
-        if has_outputs:
-            raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested rule <name>(...) for helpers")
-        body_text = "\n".join(lines[1:])
-        body_text, rule_texts = extract_top_level_named_blocks(body_text, "rule")
-        for rule_text in rule_texts:
-            rule_def = compile_rule(rule_text, file)
-            if rule_def.name in local_helper_defs:
-                raise ValueError(f"Duplicate rule {rule_def.name} in {file}")
-            local_helper_defs[rule_def.name] = rule_def
-        rebuilt_pass_text = first_line
-        if body_text:
-            rebuilt_pass_text += "\n" + body_text
-        sections = parse_pass_file(rebuilt_pass_text)
-        missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
-        if missing:
-            raise ValueError(f"Top-level $pass in {file} is missing section(s): {', '.join(missing)}")
-        raw_python = sections.get("python", "")
+    legacy_sections = parse_legacy_two_block_sections(stripped_pass, "pass")
+    if legacy_sections is not None:
+        raise ValueError(
+            f"Legacy two-block $pass syntax is no longer supported in {file}; "
+            f"use `$pass {{ ... schema {{ ... }} instance {{ ... }} }}` instead"
+        )
+
+    pass_text = unwrap_pass_block(pass_text)
+    lines = pass_text.lstrip().splitlines()
+    first_line = lines[0].strip()
+    output_params, has_outputs = parse_pass_header(first_line, file)
+    if has_outputs:
+        raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested rule <name>(...) for helpers")
+    body_text = "\n".join(lines[1:])
+    body_text, rule_texts = extract_top_level_named_blocks(body_text, "rule")
+    for rule_text in rule_texts:
+        rule_def = compile_rule(rule_text, file)
+        if rule_def.name in local_helper_defs:
+            raise ValueError(f"Duplicate rule {rule_def.name} in {file}")
+        local_helper_defs[rule_def.name] = rule_def
+    rebuilt_pass_text = first_line
+    if body_text:
+        rebuilt_pass_text += "\n" + body_text
+    sections = parse_pass_file(rebuilt_pass_text)
+    missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
+    if missing:
+        raise ValueError(f"Top-level $pass in {file} is missing section(s): {', '.join(missing)}")
+    raw_python = sections.get("python", "")
 
     instance_ops = parse_instance_section(sections["instance"])
     declared_aliases = declared_instance_aliases(instance_ops)
@@ -973,11 +934,13 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         raise ValueError(
             f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling named rules, found: {', '.join(invalid_call_targets)}"
         )
+    init_vars = run_init_python(raw_python, file)
+
     return PassDef(
         name=None,
         block_keyword="__top_level__",
-        schema=parse_schema_template(sections["schema"], None, file),
-        init_vars=run_init_python(raw_python, file),
+        schema=parse_schema_template(sections["schema"], None, file, init_vars),
+        init_vars=init_vars,
         output_params=output_params,
         instance_targets=list(dict.fromkeys(
             normalize_output_target(op.target)
@@ -1785,7 +1748,7 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, he
         if token.endswith("++"):
             pieces.append(render_expr(token, fields, counters, helper_functions))
         else:
-            value = render_variable(token, fields, counters)
+            value = render_variable(token, fields, counters, helper_functions)
             if value is None:
                 return None
             pieces.append(value)
@@ -1798,13 +1761,22 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, he
     return "".join(pieces)
 
 
-def render_variable(token: str, fields: dict[str, str], counters: dict) -> str | None:
+def render_variable(
+    token: str,
+    fields: dict[str, str],
+    counters: dict,
+    helper_functions: dict[str, object] | None = None,
+) -> str | None:
     if token in {"if", "else", "return"}:
         return None
     if token in fields:
         return fields[token]
     if token in counters:
         return str(counters[token])
+    if helper_functions and token in helper_functions:
+        value = helper_functions[token]
+        if isinstance(value, (str, int, float, bool, SymbolicExpr)):
+            return str(value)
     return None
 
 
@@ -1814,7 +1786,7 @@ def render_concat_atom(expr: str, fields: dict[str, str], counters: dict, helper
         return render_expr(expr, fields, counters, helper_functions)
     if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
         return render_value(expr, fields, counters, helper_functions)
-    value = render_variable(expr, fields, counters)
+    value = render_variable(expr, fields, counters, helper_functions)
     if value is not None:
         return value
     return render_python_expr(expr, fields, counters, helper_functions)

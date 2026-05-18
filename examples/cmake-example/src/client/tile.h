@@ -2,7 +2,6 @@
 
 struct tile {
     int index;
-#include "g/tile_decls.h"
 };
 
 #include "g/tiles.h"

@@ -3,7 +3,6 @@
 struct tile {
     int index;
     bool hit(int power) const;
-#include "g/tile_decls.h"
 };
 
 #include "g/tiles.h"

@@ -2,13 +2,13 @@
 
 #include "syntax_hints.h"
 
-$tile air {
+$tile_air {
   texture = none;
   durability = 0;
   material = empty;
 };
 
-$tile dirt {
+$tile_dirt {
   texture = tex_dirt_01;
   durability = 5;
   surface = soil;
@@ -22,25 +22,26 @@ $tile dirt {
 #include <iostream>
 
 $pass {
-  "tile "name" {"
-  "texture = "texture";"
-  "durability = "durability";"
-  ["material = "material";"|"surface = "material";"|"kind = "material";"]
-  ["onhit = "onhit";"|]
-  "};"
-} {
-  out.tile_decls += "static const tile "name";"
-  out.tiles += "inline constexpr tile tile::"name" = {"index"};"
-  out.textures += texture","
-  out.materials += material","
-  out.hits += "case tile::"name".index: {"
-  out.hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
-  out.hits += "} break;"
+  prefix = "tile_"
+
+  schema {
+    prefix name" {"
+    "texture = "texture";"
+    "durability = "durability";"
+    ["material = "material";"|"surface = "material";"|"kind = "material";"]
+    ["onhit = "onhit";"|]
+    "};"
+  }
+
+  instance {
+    out.tiles += "inline constexpr tile "prefix name" = {"index"};"
+    out.textures += texture","
+    out.materials += material","
+    out.hits += "case "prefix name".index: {"
+    out.hits += { return durability == "0" ? "return false;" : onhit"return power >= "durability";" }
+    out.hits += "} break;"
+  }
 };
-
-
-
-namespace tiles {
 constexpr std::size_t width = 4;
 constexpr std::size_t height = 4;
 
@@ -58,7 +59,6 @@ inline tile get_tile(std::size_t x, std::size_t y) {
     return map[tile_offset(x, y)];
 }
 
-inline void init_tiles(tile value = tile::air) {
+inline void init_tiles(tile value = tile_air) {
     map.fill(value);
-}
 }

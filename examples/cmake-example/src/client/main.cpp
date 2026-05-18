@@ -17,11 +17,11 @@ enum tile_material {
 #include "shared/tiles.h"
 
 int main() {
-    tiles::init_tiles();
-    tiles::set_tile(3, 0, tile::dirt);
+    init_tiles();
+    set_tile(3, 0, tile_dirt);
 
-    const tile selected = tiles::get_tile(3, 0);
+    const tile selected = get_tile(3, 0);
     std::cout << "client: selected.index = " << selected.index << "\n";
-    std::cout << "client: starter item weight = " << item_weight(items::starter()) << "\n";
+    std::cout << "client: starter item weight = " << item_weight(starter()) << "\n";
     return 0;
 }

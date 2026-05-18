@@ -2,26 +2,29 @@
 
 #include "syntax_hints.h"
 
-$item coin {
+$item_coin {
   weight = 1;
 };
 
-$item stone {
+$item_stone {
   weight = 4;
 };
 
 $pass {
-  "item "name" {"
-  "weight = "weight";"
-  "};"
-} {
-  out.item_decls += "static const item "name";"
-  out.items += "inline constexpr item item::"name" = {"index"};"
-  out.item_weights += weight","
+  prefix = "item_"
+
+  schema {
+    prefix name" {"
+    "weight = "weight";"
+    "};"
+  }
+
+  instance {
+    out.items += "inline constexpr item "prefix name" = {"index"};"
+    out.item_weights += weight","
+  }
 };
 
-namespace items {
 inline item starter() {
-    return item::coin;
-}
+    return item_coin;
 }
