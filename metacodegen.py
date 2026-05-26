@@ -1,6 +1,13 @@
 """
 Scans shared source files for $ markers, generates shared headers once,
 and writes cleaned copies of the shared sources into a shared build folder.
+
+Pass authoring note for future developers:
+- Do not use Python f-strings or rf-strings inside `src/shared/passes/*`.
+- Pass files have their own templating/concatenation style such as
+  `"prefix "value" suffix"` and helper-function string concatenation.
+- Keeping pass source in that dedicated style avoids mixing two interpolation
+  systems and keeps pass syntax readable and predictable.
 """
 
 import argparse
@@ -408,6 +415,9 @@ def parse_legacy_schema_parts(
         if ident:
             name = ident.group(0)
             i += len(name)
+            if name == "eof":
+                parts.append(SchemaPart("eof"))
+                continue
             if i < len(source) and source[i] == "[":
                 branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, init_vars, capture_name=name)
                 parts.append(branch)
@@ -1156,6 +1166,12 @@ def match_schema_nodes(
             if matched is not None:
                 return matched
         return None
+
+    if part.kind == "eof":
+        end = skip_c_whitespace(source, pos)
+        if end != len(source):
+            return None
+        return match_schema_nodes(source, schema, index + 1, end, values, allow_trailing)
 
     if index == len(schema) - 1 and allow_trailing:
         capture_positions = list(reversed(list(iter_capture_end_positions(source, pos))))
