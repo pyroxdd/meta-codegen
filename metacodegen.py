@@ -69,6 +69,7 @@ class SchemaPart:
     kind: str
     value: str = ""
     alternatives: list[list["SchemaPart"]] | None = None
+    alternative_labels: list[str | None] | None = None
     capture_name: str | None = None
 
 
@@ -442,12 +443,19 @@ def parse_legacy_schema_branch(
     capture_name: str | None = None,
 ) -> tuple[SchemaPart, int]:
     alternatives = []
+    alternative_labels = []
     saw_separator = False
     i = start
 
     while True:
+        label = None
+        label_match = re.match(r'([A-Za-z_]\w*)@', source[i:])
+        if label_match is not None:
+            label = label_match.group(1)
+            i += len(label_match.group(0))
         parts, i = parse_legacy_schema_parts(source, i, True, pass_name, file, init_vars)
         alternatives.append(parts)
+        alternative_labels.append(label)
         if i >= len(source):
             raise ValueError(f"Unterminated schema branch in $pass {pass_name} in {file}")
         if source[i] == "|":
@@ -457,7 +465,20 @@ def parse_legacy_schema_branch(
         if source[i] == "]":
             if not saw_separator:
                 raise ValueError(f"Schema branch in $pass {pass_name} in {file} must contain '|'")
-            return SchemaPart("branch", alternatives=alternatives, capture_name=capture_name), i + 1
+            if capture_name is not None:
+                missing_labels = [index for index, value in enumerate(alternative_labels) if value is None]
+                if missing_labels:
+                    raise ValueError(
+                        f"Captured schema branch {capture_name!r} in $pass {pass_name} in {file} requires labels for every alternative"
+                    )
+                seen_labels: set[str] = set()
+                for label_value in alternative_labels:
+                    if label_value in seen_labels:
+                        raise ValueError(
+                            f"Captured schema branch {capture_name!r} in $pass {pass_name} in {file} has duplicate label {label_value!r}"
+                        )
+                    seen_labels.add(label_value)
+            return SchemaPart("branch", alternatives=alternatives, alternative_labels=alternative_labels, capture_name=capture_name), i + 1
         raise ValueError(f"Invalid schema branch in $pass {pass_name} in {file}: {source[i:i+20]!r}")
 
 
@@ -472,7 +493,7 @@ def compact_schema_parts(parts: list[SchemaPart], pass_name: str, file: Path) ->
             ]
             if not any(alternatives):
                 continue
-            compact.append(SchemaPart("branch", alternatives=alternatives, capture_name=part.capture_name))
+            compact.append(SchemaPart("branch", alternatives=alternatives, alternative_labels=part.alternative_labels, capture_name=part.capture_name))
             continue
 
         if part.kind == "literal":
@@ -628,14 +649,14 @@ def parse_instance_section(instance_body: str) -> list[InstanceOp]:
 
     def parse_if_statement(line_text: str, line_index: int) -> tuple[InstanceOp, int]:
         stripped = line_text.strip()
-        if_match = re.match(r'\s*if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s*(.*)$', line_text)
+        if_match = re.match(r'\s*if\s+(\w+)\s*(==|!=)\s*(?:"([^"]*?)"|([A-Za-z_]\w*))\s*(.*)$', line_text)
         if if_match is None:
             raise ValueError(f"Unsupported if statement: {stripped!r}")
 
         field_name = if_match.group(1)
         op = if_match.group(2)
-        cmp_value = if_match.group(3)
-        rest = if_match.group(4).strip()
+        cmp_value = if_match.group(3) if if_match.group(3) is not None else if_match.group(4)
+        rest = if_match.group(5).strip()
 
         if rest == "{":
             true_ops, next_i = parse_ops(line_index + 1, stop_on_else=True)
@@ -866,11 +887,14 @@ def compile_rule(rule_text: str, file: Path) -> PassDef:
                 )
 
     init_vars = run_init_python(raw_python, file)
+    schema = parse_schema_template(sections["schema"], name, file, init_vars)
+    for label in collect_schema_branch_labels(schema):
+        init_vars.setdefault(label, label)
 
     return PassDef(
         name=name,
         block_keyword=name,
-        schema=parse_schema_template(sections["schema"], name, file, init_vars),
+        schema=schema,
         init_vars=init_vars,
         output_params=output_params,
         instance_targets=[],
@@ -945,11 +969,19 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
             f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling named rules, found: {', '.join(invalid_call_targets)}"
         )
     init_vars = run_init_python(raw_python, file)
+    schema = parse_schema_template(sections["schema"], None, file, init_vars)
+    enum_labels = collect_schema_branch_labels(schema)
+    for helper_def in local_helper_defs.values():
+        enum_labels.update(collect_schema_branch_labels(helper_def.schema))
+    for label in enum_labels:
+        init_vars.setdefault(label, label)
+        for helper_def in local_helper_defs.values():
+            helper_def.init_vars.setdefault(label, label)
 
     return PassDef(
         name=None,
         block_keyword="__top_level__",
-        schema=parse_schema_template(sections["schema"], None, file, init_vars),
+        schema=schema,
         init_vars=init_vars,
         output_params=output_params,
         instance_targets=list(dict.fromkeys(
@@ -1134,6 +1166,19 @@ def collect_schema_capture_names(schema: list[SchemaPart]) -> set[str]:
     return names
 
 
+def collect_schema_branch_labels(schema: list[SchemaPart]) -> set[str]:
+    labels: set[str] = set()
+    for part in schema:
+        if part.kind != "branch":
+            continue
+        for label in part.alternative_labels or []:
+            if label is not None:
+                labels.add(label)
+        for alternative in part.alternatives or []:
+            labels.update(collect_schema_branch_labels(alternative))
+    return labels
+
+
 def match_schema_nodes(
     source: str,
     schema: list[SchemaPart],
@@ -1155,13 +1200,15 @@ def match_schema_nodes(
         return match_schema_nodes(source, schema, index + 1, end, values, allow_trailing)
 
     if part.kind == "branch":
-        for alternative in part.alternatives or []:
+        for alt_index, alternative in enumerate(part.alternatives or []):
             matched_alternative = match_schema_nodes(source, alternative, 0, pos, values.copy(), allow_trailing=True)
             if matched_alternative is None:
                 continue
             alternative_end, alternative_values = matched_alternative
             if part.capture_name:
-                alternative_values[part.capture_name] = source[pos:alternative_end]
+                if not part.alternative_labels or part.alternative_labels[alt_index] is None:
+                    return None
+                alternative_values[part.capture_name] = part.alternative_labels[alt_index]
             matched = match_schema_nodes(source, schema, index + 1, alternative_end, alternative_values, allow_trailing)
             if matched is not None:
                 return matched
@@ -1526,6 +1573,9 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
     scope = {}
     scope.update(counters)
     scope.update(fields)
+    for field_value in fields.values():
+        if isinstance(field_value, str) and re.fullmatch(r"[A-Za-z_]\w*", field_value):
+            scope.setdefault(field_value, field_value)
     scope.update(helper_functions)
     scope["__post_inc__"] = post_inc
     try:
@@ -1603,7 +1653,7 @@ def render_block(body: str, fields: dict[str, str], counters: dict, helper_funct
 
 
 def parse_ternary(expr: str) -> tuple[str, str, str, str, str] | None:
-    m = re.match(r'(\w+)\s*(==|!=)\s*"([^"]*?)"\s*\?', expr)
+    m = re.match(r'(\w+)\s*(==|!=)\s*(?:"([^"]*?)"|([A-Za-z_]\w*))\s*\?', expr)
     if not m:
         return None
 
@@ -1615,14 +1665,14 @@ def parse_ternary(expr: str) -> tuple[str, str, str, str, str] | None:
     return (
         m.group(1),
         m.group(2),
-        m.group(3),
+        m.group(3) if m.group(3) is not None else m.group(4),
         expr[true_start:colon].strip(),
         expr[colon + 1:].strip(),
     )
 
 
 def parse_prefix_condition(expr: str) -> tuple[str, str, str, str, str] | None:
-    m = re.match(r'if\s+(\w+)\s*(==|!=)\s*"([^"]*?)"\s*\{', expr)
+    m = re.match(r'if\s+(\w+)\s*(==|!=)\s*(?:"([^"]*?)"|([A-Za-z_]\w*))\s*\{', expr)
     if not m:
         return None
 
@@ -1649,7 +1699,7 @@ def parse_prefix_condition(expr: str) -> tuple[str, str, str, str, str] | None:
     return (
         m.group(1),
         m.group(2),
-        m.group(3),
+        m.group(3) if m.group(3) is not None else m.group(4),
         expr[true_start:true_end].strip(),
         rest[false_start_in_rest:false_end_in_rest].strip(),
     )
