@@ -420,8 +420,13 @@ def parse_legacy_schema_parts(
                 parts.append(SchemaPart("eof"))
                 continue
             if i < len(source) and source[i] == "[":
-                branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, init_vars, capture_name=name)
-                parts.append(branch)
+                branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, init_vars)
+                if branch.alternative_labels and all(label is not None for label in branch.alternative_labels):
+                    branch.capture_name = name
+                    parts.append(branch)
+                else:
+                    parts.append(SchemaPart("capture", name))
+                    parts.append(branch)
                 continue
             literal_value = schema_literal_var_value(name, init_vars)
             if literal_value is not None:
