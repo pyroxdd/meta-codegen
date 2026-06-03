@@ -1244,12 +1244,23 @@ def match_schema_nodes(
 def match_schema_literal(source: str, start: int, literal: str) -> int | None:
     i = start
     j = 0
+    literal_is_space_only = literal != "" and all(ch == " " for ch in literal)
 
     while j < len(literal):
-        if literal[j].isspace():
-            while j < len(literal) and literal[j].isspace():
+        if literal[j] == " ":
+            while j < len(literal) and literal[j] == " ":
                 j += 1
-            i = skip_c_whitespace(source, i)
+            next_i = skip_c_whitespace(source, i)
+            if literal_is_space_only and next_i == i:
+                return None
+            i = next_i
+            continue
+
+        if literal[j] in "\n\r\t":
+            if i >= len(source) or source[i] != literal[j]:
+                return None
+            i += 1
+            j += 1
             continue
 
         if i >= len(source) or source[i] != literal[j]:
@@ -1978,6 +1989,7 @@ def execute_instance_ops(
     local_output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
+    helper_call_stack: list[tuple[str, str]] | None = None,
 ) -> None:
     helper_functions: dict[str, object] = dict(pass_def.init_vars)
 
@@ -2037,6 +2049,7 @@ def execute_instance_ops(
                     bound_outputs,
                     global_accs,
                     global_pass_instances,
+                    helper_call_stack,
                 )
             else:
                 input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
@@ -2049,6 +2062,7 @@ def execute_instance_ops(
                     bound_outputs,
                     global_accs,
                     global_pass_instances,
+                    helper_call_stack,
                 )
             continue
 
@@ -2084,6 +2098,7 @@ def execute_instance_ops(
                     local_output_bindings,
                     global_accs,
                     global_pass_instances,
+                    helper_call_stack,
                 )
             continue
 
@@ -2099,39 +2114,70 @@ def execute_named_pass(
     output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
+    helper_call_stack: list[tuple[str, str]] | None = None,
 ) -> None:
     import copy
 
-    state = {}
-    for key, value in pass_def.init_vars.items():
-        if isinstance(value, list):
-            continue
-        if isinstance(value, (dict, set, tuple)):
-            state[key] = copy.deepcopy(value)
-        else:
-            state[key] = value
+    if helper_call_stack is None:
+        helper_call_stack = []
 
-    local_index = 0
-    schema_capture_names = collect_schema_capture_names(pass_def.schema)
+    helper_name = pass_def.name or "<unnamed>"
+    call_signature = (helper_name, input_text)
+    if call_signature in helper_call_stack:
+        cycle_start = helper_call_stack.index(call_signature)
+        cycle = helper_call_stack[cycle_start:] + [call_signature]
+        cycle_lines = []
+        for cycle_name, cycle_input in cycle:
+            snippet = cycle_input[:80].replace("\n", "\\n").replace("\r", "\\r")
+            cycle_lines.append(f"{cycle_name}({snippet!r})")
+        raise ValueError(
+            "Recursive helper pass call made no progress:\n  " + "\n  ".join(cycle_lines)
+        )
 
-    for item_text in iter_top_level_items(input_text):
-        inherited_fields = outer_fields.copy()
-        for capture_name in schema_capture_names:
-            inherited_fields.pop(capture_name, None)
-        matched = match_schema_nodes(item_text, pass_def.schema, 0, 0, inherited_fields, allow_trailing=True)
-        if matched is None:
-            snippet = item_text[:40]
-            raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
+    helper_call_stack.append(call_signature)
 
-        end, fields = matched
-        if end <= 0:
-            raise ValueError(f"Helper pass {pass_def.name} made no progress")
+    try:
+        state = {}
+        for key, value in pass_def.init_vars.items():
+            if isinstance(value, list):
+                continue
+            if isinstance(value, (dict, set, tuple)):
+                state[key] = copy.deepcopy(value)
+            else:
+                state[key] = value
 
-        counters = copy.deepcopy(state)
-        counters.update(outer_counters)
-        counters["index"] = local_index
-        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs, global_pass_instances)
-        local_index += 1
+        local_index = 0
+        schema_capture_names = collect_schema_capture_names(pass_def.schema)
+
+        for item_text in iter_top_level_items(input_text):
+            inherited_fields = outer_fields.copy()
+            for capture_name in schema_capture_names:
+                inherited_fields.pop(capture_name, None)
+            matched = match_schema_nodes(item_text, pass_def.schema, 0, 0, inherited_fields, allow_trailing=True)
+            if matched is None:
+                snippet = item_text[:40]
+                raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
+
+            end, fields = matched
+            if end <= 0:
+                raise ValueError(f"Helper pass {pass_def.name} made no progress")
+
+            counters = copy.deepcopy(state)
+            counters.update(outer_counters)
+            counters["index"] = local_index
+            execute_instance_ops(
+                pass_def,
+                fields,
+                counters,
+                helper_defs,
+                output_bindings,
+                global_accs,
+                global_pass_instances,
+                helper_call_stack,
+            )
+            local_index += 1
+    finally:
+        helper_call_stack.pop()
 
 
 def execute_pass_instance_helper(
@@ -2143,6 +2189,7 @@ def execute_pass_instance_helper(
     output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
+    helper_call_stack: list[tuple[str, str]] | None = None,
 ) -> None:
     import copy
 
@@ -2161,7 +2208,16 @@ def execute_pass_instance_helper(
         counters = copy.deepcopy(state)
         counters.update(outer_counters)
         counters["index"] = local_index
-        execute_instance_ops(pass_def, fields, counters, helper_defs, output_bindings, global_accs, global_pass_instances)
+        execute_instance_ops(
+            pass_def,
+            fields,
+            counters,
+            helper_defs,
+            output_bindings,
+            global_accs,
+            global_pass_instances,
+            helper_call_stack,
+        )
 
 
 def render_fragments(
