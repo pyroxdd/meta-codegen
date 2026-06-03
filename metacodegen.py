@@ -45,6 +45,14 @@ class PassDef:
     instance_ops: list["InstanceOp"]
     is_helper: bool = False
     local_helper_defs: dict[str, "PassDef"] = field(default_factory=dict)
+    local_func_defs: dict[str, "FuncDef"] = field(default_factory=dict)
+
+
+@dataclass
+class FuncDef:
+    name: str
+    params: list[str]
+    instance_ops: list["InstanceOp"]
 
 
 @dataclass
@@ -60,6 +68,7 @@ class InstanceOp:
     condition_field: str | None = None
     condition_op: str | None = None
     condition_value: str | None = None
+    condition_value_is_ref: bool = False
     true_ops: list["InstanceOp"] | None = None
     false_ops: list["InstanceOp"] | None = None
 
@@ -573,6 +582,36 @@ def schema_starts_with_keyword(literal: str, keyword: str) -> bool:
 
 def run_init_python(source: str, file: Path) -> dict:
     source = textwrap.dedent(source).strip()
+    literal_assignments: dict[str, object] = {}
+    if source:
+        allowed_python_lines: list[str] = []
+        for line_no, raw_line in enumerate(source.splitlines(), start=1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            assign_match = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.+)", stripped)
+            if assign_match is not None:
+                name, expr = assign_match.groups()
+                try:
+                    literal_assignments[name] = ast.literal_eval(expr)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Only literal assignments are allowed in raw python sections of $pass blocks now; "
+                        f"found {stripped!r} in {file}:{line_no}: {exc}"
+                    ) from exc
+                continue
+            if re.fullmatch(r"from\s+[A-Za-z_][\w\.]*\s+import\s+[A-Za-z_][\w\s,]*", stripped):
+                allowed_python_lines.append(stripped)
+                continue
+            if re.fullmatch(r"import\s+[A-Za-z_][\w\.]*(\s+as\s+[A-Za-z_]\w*)?", stripped):
+                allowed_python_lines.append(stripped)
+                continue
+            raise ValueError(
+                f"Only import statements and literal assignments are allowed in raw python sections of $pass blocks now; "
+                f"found {stripped!r} in {file}:{line_no}"
+            )
+        source = "\n".join(allowed_python_lines)
+
     safe_builtins = {
         "__import__": __import__,
         "abs": abs,
@@ -608,6 +647,7 @@ def run_init_python(source: str, file: Path) -> dict:
         raise ValueError(f"Invalid raw python in $pass block in {file}: {exc}") from exc
     finally:
         sys.path[:] = previous_sys_path
+    scope.update(literal_assignments)
     return {key: value for key, value in scope.items() if not key.startswith("__")}
 
 
@@ -661,6 +701,7 @@ def parse_instance_section(instance_body: str) -> list[InstanceOp]:
         field_name = if_match.group(1)
         op = if_match.group(2)
         cmp_value = if_match.group(3) if if_match.group(3) is not None else if_match.group(4)
+        cmp_is_ref = if_match.group(3) is None and if_match.group(4) is not None
         rest = if_match.group(5).strip()
 
         if rest == "{":
@@ -693,6 +734,7 @@ def parse_instance_section(instance_body: str) -> list[InstanceOp]:
             condition_field=field_name,
             condition_op=op,
             condition_value=cmp_value,
+            condition_value_is_ref=cmp_is_ref,
             true_ops=true_ops,
             false_ops=false_ops,
         ), next_i
@@ -908,9 +950,37 @@ def compile_rule(rule_text: str, file: Path) -> PassDef:
     )
 
 
+def compile_func(func_text: str, file: Path) -> FuncDef:
+    stripped_func = func_text.strip()
+    unwrapped = unwrap_pass_block(re.sub(r"^\s*func\b", "pass", stripped_func, count=1))
+    lines = unwrapped.lstrip().splitlines()
+    first_line = lines[0].strip()
+    name, params = parse_named_block_header(first_line.replace("pass", "func", 1), file, "func")
+    if name is None:
+        raise ValueError(f"func in {file} must declare a name")
+
+    body_text = "\n".join(lines[1:])
+    instance_ops = parse_instance_section(body_text)
+    declared_aliases = declared_instance_aliases(instance_ops)
+    invalid_emit_targets = sorted({
+        op.target for op in iter_instance_ops(instance_ops)
+        if op.kind == "emit" and op.target is not None and op.target not in declared_aliases and op.target != "out"
+    })
+    if invalid_emit_targets:
+        raise ValueError(
+            f"func {name} in {file} may only write to local variables or 'out', found: {', '.join(invalid_emit_targets)}"
+        )
+    return FuncDef(
+        name=name,
+        params=params,
+        instance_ops=instance_ops,
+    )
+
+
 def compile_pass(pass_text: str, file: Path) -> PassDef:
     stripped_pass = pass_text.strip()
     local_helper_defs: dict[str, PassDef] = {}
+    local_func_defs: dict[str, FuncDef] = {}
     legacy_sections = parse_legacy_two_block_sections(stripped_pass, "pass")
     if legacy_sections is not None:
         raise ValueError(
@@ -925,6 +995,12 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     if has_outputs:
         raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested rule <name>(...) for helpers")
     body_text = "\n".join(lines[1:])
+    body_text, func_texts = extract_top_level_named_blocks(body_text, "func")
+    for func_text in func_texts:
+        func_def = compile_func(func_text, file)
+        if func_def.name in local_func_defs:
+            raise ValueError(f"Duplicate func {func_def.name} in {file}")
+        local_func_defs[func_def.name] = func_def
     body_text, rule_texts = extract_top_level_named_blocks(body_text, "rule")
     for rule_text in rule_texts:
         rule_def = compile_rule(rule_text, file)
@@ -982,6 +1058,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         init_vars.setdefault(label, label)
         for helper_def in local_helper_defs.values():
             helper_def.init_vars.setdefault(label, label)
+            helper_def.local_func_defs = local_func_defs
 
     return PassDef(
         name=None,
@@ -997,6 +1074,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         instance_ops=instance_ops,
         is_helper=False,
         local_helper_defs=local_helper_defs,
+        local_func_defs=local_func_defs,
     )
 
 
@@ -1579,6 +1657,63 @@ def resolve_output_sink(
     )
 
 
+def call_pass_func(
+    func_def: FuncDef,
+    arg_values: list[str],
+    fields: dict[str, str],
+    counters: dict,
+    helper_functions: dict[str, object],
+) -> str:
+    if len(arg_values) != len(func_def.params):
+        raise ValueError(f"func {func_def.name} expects {len(func_def.params)} args, got {len(arg_values)}")
+
+    local_fields = fields.copy()
+    for param, value in zip(func_def.params, arg_values):
+        local_fields[param] = value
+
+    local_func_defs = {
+        name: value
+        for name, value in helper_functions.items()
+        if isinstance(value, FuncDef)
+    }
+
+    local_output_bindings = {"out": []}
+    execute_instance_ops(
+        PassDef(
+            name=func_def.name,
+            block_keyword=func_def.name,
+            schema=[],
+            init_vars={},
+            output_params=[],
+            instance_targets=[],
+            instance_ops=func_def.instance_ops,
+            is_helper=True,
+            local_func_defs=local_func_defs,
+        ),
+        local_fields,
+        counters,
+        {},
+        local_output_bindings,
+        {},
+        None,
+        None,
+    )
+    return "".join(local_output_bindings["out"])
+
+
+def render_pass_func_expr(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
+    m = re.fullmatch(r"([A-Za-z_]\w*)\((.*)\)", expr.strip())
+    if m is None:
+        return None
+    func_name, args_text = m.groups()
+    func_def = helper_functions.get(func_name)
+    if not isinstance(func_def, FuncDef):
+        return None
+    arg_exprs = [part for part in split_top_level(args_text, ",")] if args_text.strip() else []
+    arg_values = [render_expr(arg_expr, fields, counters, helper_functions) for arg_expr in arg_exprs]
+    return call_pass_func(func_def, arg_values, fields, counters, helper_functions)
+
+
 def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
     def post_inc(name: str):
         value = counters.get(name, 0)
@@ -1618,6 +1753,10 @@ def render_expr(expr: str, fields: dict[str, str], counters: dict, helper_functi
         counters[var] = val + 1
         return str(val)
 
+    pass_func_value = render_pass_func_expr(expr, fields, counters, helper_functions)
+    if pass_func_value is not None:
+        return pass_func_value
+
     concat = render_implicit_concat(expr, fields, counters, helper_functions)
     if concat is not None:
         return concat
@@ -1646,8 +1785,9 @@ def render_block(body: str, fields: dict[str, str], counters: dict, helper_funct
     body = body.strip()
     condition = parse_prefix_condition(body)
     if condition is not None:
-        f, op, cmp, true_body, false_body = condition
-        cond = fields.get(f, "") == cmp
+        f, op, cmp, cmp_is_ref, true_body, false_body = condition
+        cmp_value = resolve_condition_operand(cmp, cmp_is_ref, fields, counters, helper_functions)
+        cond = fields.get(f, "") == cmp_value
         if op == "!=":
             cond = not cond
         return render_block(true_body if cond else false_body, fields, counters, helper_functions)
@@ -1660,15 +1800,16 @@ def render_block(body: str, fields: dict[str, str], counters: dict, helper_funct
         expr = expr[:-1].strip()
     ternary = parse_ternary(expr)
     if ternary is not None:
-        f, op, cmp, true_expr, false_expr = ternary
-        cond = fields.get(f, "") == cmp
+        f, op, cmp, cmp_is_ref, true_expr, false_expr = ternary
+        cmp_value = resolve_condition_operand(cmp, cmp_is_ref, fields, counters, helper_functions)
+        cond = fields.get(f, "") == cmp_value
         if op == "!=":
             cond = not cond
         return render_expr(true_expr if cond else false_expr, fields, counters, helper_functions)
     return render_expr(expr, fields, counters, helper_functions)
 
 
-def parse_ternary(expr: str) -> tuple[str, str, str, str, str] | None:
+def parse_ternary(expr: str) -> tuple[str, str, str, bool, str, str] | None:
     m = re.match(r'(\w+)\s*(==|!=)\s*(?:"([^"]*?)"|([A-Za-z_]\w*))\s*\?', expr)
     if not m:
         return None
@@ -1682,12 +1823,13 @@ def parse_ternary(expr: str) -> tuple[str, str, str, str, str] | None:
         m.group(1),
         m.group(2),
         m.group(3) if m.group(3) is not None else m.group(4),
+        m.group(3) is None and m.group(4) is not None,
         expr[true_start:colon].strip(),
         expr[colon + 1:].strip(),
     )
 
 
-def parse_prefix_condition(expr: str) -> tuple[str, str, str, str, str] | None:
+def parse_prefix_condition(expr: str) -> tuple[str, str, str, bool, str, str] | None:
     m = re.match(r'if\s+(\w+)\s*(==|!=)\s*(?:"([^"]*?)"|([A-Za-z_]\w*))\s*\{', expr)
     if not m:
         return None
@@ -1716,6 +1858,7 @@ def parse_prefix_condition(expr: str) -> tuple[str, str, str, str, str] | None:
         m.group(1),
         m.group(2),
         m.group(3) if m.group(3) is not None else m.group(4),
+        m.group(3) is None and m.group(4) is not None,
         expr[true_start:true_end].strip(),
         rest[false_start_in_rest:false_end_in_rest].strip(),
     )
@@ -1864,7 +2007,9 @@ def render_implicit_concat(expr: str, fields: dict[str, str], counters: dict, he
             call_end = find_call_end(expr, token_end)
             if call_end is None:
                 return None
-            value = render_python_expr(expr[i:call_end], fields, counters, helper_functions)
+            value = render_pass_func_expr(expr[i:call_end], fields, counters, helper_functions)
+            if value is None:
+                value = render_python_expr(expr[i:call_end], fields, counters, helper_functions)
             if value is None:
                 return None
             pieces.append(value)
@@ -1910,6 +2055,23 @@ def render_variable(
     return None
 
 
+def resolve_condition_operand(
+    token: str,
+    is_ref: bool,
+    fields: dict[str, str],
+    counters: dict,
+    helper_functions: dict[str, object],
+) -> str:
+    if not is_ref:
+        return token
+    value = render_variable(token, fields, counters, helper_functions)
+    if value is None:
+        raise ValueError(
+            f"Unknown condition symbol {token!r}; quote string literals explicitly, for example \"{token}\""
+        )
+    return value
+
+
 def render_concat_atom(expr: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str | None:
     expr = expr.strip()
     if expr.endswith("++"):
@@ -1919,6 +2081,9 @@ def render_concat_atom(expr: str, fields: dict[str, str], counters: dict, helper
     value = render_variable(expr, fields, counters, helper_functions)
     if value is not None:
         return value
+    pass_func_value = render_pass_func_expr(expr, fields, counters, helper_functions)
+    if pass_func_value is not None:
+        return pass_func_value
     return render_python_expr(expr, fields, counters, helper_functions)
 
 
@@ -1992,6 +2157,7 @@ def execute_instance_ops(
     helper_call_stack: list[tuple[str, str]] | None = None,
 ) -> None:
     helper_functions: dict[str, object] = dict(pass_def.init_vars)
+    helper_functions.update(pass_def.local_func_defs)
 
     def template_fields() -> dict[str, str]:
         scoped = fields.copy()
@@ -2074,7 +2240,14 @@ def execute_instance_ops(
                 field_value = "".join(local_output_bindings[op.condition_field])
             if field_value is None:
                 field_value = ""
-            matches = field_value == op.condition_value
+            condition_value = resolve_condition_operand(
+                op.condition_value,
+                op.condition_value_is_ref,
+                fields,
+                counters,
+                helper_functions,
+            )
+            matches = field_value == condition_value
             if op.condition_op == "!=":
                 matches = not matches
             branch_ops = op.true_ops if matches else op.false_ops
