@@ -274,7 +274,7 @@ def parse_pass_file(source: str) -> dict[str, str]:
         section_name = legacy_section_match.group(1)
         raise ValueError(
             f"Deprecated {section_name}() section syntax is no longer supported; "
-            f"use `{section_name} {{ ... }}` inside the surrounding pass or rule block instead"
+            f"use `{section_name} {{ ... }}` inside the surrounding pass or local pass block instead"
         )
 
     section_re = re.compile(
@@ -811,7 +811,8 @@ def declared_instance_aliases(ops: list[InstanceOp]) -> set[str]:
 
 
 def parse_named_block_header(header: str, file: Path, keyword: str) -> tuple[str | None, list[str]]:
-    m = re.match(rf"{re.escape(keyword)}(?:[ \t]+(\w+)(?:\(([^)]*)\))?)?\s*\{{?\s*;?\s*$", header)
+    keyword_pattern = re.sub(r"\\ ", r"[ \t]+", re.escape(keyword))
+    m = re.match(rf"{keyword_pattern}(?:[ \t]+(\w+)(?:\(([^)]*)\))?)?\s*\{{?\s*;?\s*$", header)
     if not m:
         raise ValueError(f"Expected {keyword} or {keyword} <name>(...) in {file}")
     name = m.group(1)
@@ -819,6 +820,10 @@ def parse_named_block_header(header: str, file: Path, keyword: str) -> tuple[str
     if m.group(2):
         output_params = [part.strip() for part in m.group(2).split(",") if part.strip()]
     return name, output_params
+
+
+def normalize_local_pass_header(text: str) -> str:
+    return re.sub(r"^\s*local[ \t]+pass\b", "pass", text, count=1)
 
 
 def parse_pass_header(header: str, file: Path) -> tuple[str | None, list[str], bool]:
@@ -896,49 +901,49 @@ def parse_legacy_two_block_sections(block_text: str, keyword: str) -> tuple[str,
     )
 
 
-def compile_rule(rule_text: str, file: Path) -> PassDef:
-    stripped_rule = rule_text.strip()
-    legacy_sections = parse_legacy_two_block_sections(stripped_rule, "rule")
+def compile_local_pass(local_pass_text: str, file: Path) -> PassDef:
+    stripped_local_pass = local_pass_text.strip()
+    legacy_sections = parse_legacy_two_block_sections(stripped_local_pass, "local pass")
     if legacy_sections is not None:
         raise ValueError(
-            f"Legacy two-block rule syntax is no longer supported in {file}; "
-            f"use `rule <name>(...) {{ ... schema {{ ... }} instance {{ ... }} }}` instead"
+            f"Legacy two-block local pass syntax is no longer supported in {file}; "
+            f"use `local pass <name>(...) {{ ... schema {{ ... }} instance {{ ... }} }}` instead"
         )
 
-    unwrapped = unwrap_pass_block(re.sub(r"^\s*rule\b", "pass", stripped_rule, count=1))
+    unwrapped = unwrap_pass_block(normalize_local_pass_header(stripped_local_pass))
     lines = unwrapped.lstrip().splitlines()
     first_line = lines[0].strip()
-    name, output_params = parse_named_block_header(first_line.replace("pass", "rule", 1), file, "rule")
-    rebuilt_rule_text = first_line
+    name, output_params = parse_named_block_header(first_line.replace("pass", "local pass", 1), file, "local pass")
+    rebuilt_local_pass_text = first_line
     body_text = "\n".join(lines[1:])
     if body_text:
-        rebuilt_rule_text += "\n" + body_text
-    sections = parse_pass_file(rebuilt_rule_text)
+        rebuilt_local_pass_text += "\n" + body_text
+    sections = parse_pass_file(rebuilt_local_pass_text)
     missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
     if missing:
-        raise ValueError(f"rule {name or '<unnamed>'} is missing section(s): {', '.join(missing)}")
+        raise ValueError(f"local pass {name or '<unnamed>'} is missing section(s): {', '.join(missing)}")
     raw_python = sections.get("python", "")
 
     if name is None:
-        raise ValueError(f"rule in {file} must declare a name")
+        raise ValueError(f"local pass in {file} must declare a name")
 
     instance_ops = parse_instance_section(sections["instance"])
     declared_aliases = declared_instance_aliases(instance_ops)
     if not output_params:
-        raise ValueError(f"rule {name} must declare at least one output parameter; implicit return output is not supported")
+        raise ValueError(f"local pass {name} must declare at least one output parameter; implicit return output is not supported")
     invalid_targets = sorted({
         op.target for op in iter_instance_ops(instance_ops)
         if op.kind == "emit" and op.target not in output_params and op.target not in declared_aliases
     })
     if invalid_targets:
-        raise ValueError(f"rule {name} may only write to declared outputs {output_params}, found: {', '.join(invalid_targets)}")
+        raise ValueError(f"local pass {name} may only write to declared outputs {output_params}, found: {', '.join(invalid_targets)}")
     for op in iter_instance_ops(instance_ops):
         if op.kind == "assign":
             if op.source_target is None:
                 continue
             if op.source_target not in output_params and op.source_target not in declared_aliases:
                 raise ValueError(
-                    f"rule {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
+                    f"local pass {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
                 )
 
     init_vars = run_init_python(raw_python, file)
@@ -1002,7 +1007,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     first_line = lines[0].strip()
     top_level_name, output_params, has_outputs = parse_pass_header(first_line, file)
     if has_outputs:
-        raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested rule <name>(...) for helpers")
+        raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested local pass <name>(...) for helpers")
     body_text = "\n".join(lines[1:])
     body_text, func_texts = extract_top_level_named_blocks(body_text, "func")
     for func_text in func_texts:
@@ -1010,12 +1015,12 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         if func_def.name in local_func_defs:
             raise ValueError(f"Duplicate func {func_def.name} in {file}")
         local_func_defs[func_def.name] = func_def
-    body_text, rule_texts = extract_top_level_named_blocks(body_text, "rule")
-    for rule_text in rule_texts:
-        rule_def = compile_rule(rule_text, file)
-        if rule_def.name in local_helper_defs:
-            raise ValueError(f"Duplicate rule {rule_def.name} in {file}")
-        local_helper_defs[rule_def.name] = rule_def
+    body_text, local_pass_texts = extract_top_level_named_blocks(body_text, "local pass")
+    for local_pass_text in local_pass_texts:
+        local_pass_def = compile_local_pass(local_pass_text, file)
+        if local_pass_def.name in local_helper_defs:
+            raise ValueError(f"Duplicate local pass {local_pass_def.name} in {file}")
+        local_helper_defs[local_pass_def.name] = local_pass_def
     rebuilt_pass_text = first_line
     if body_text:
         rebuilt_pass_text += "\n" + body_text
@@ -1056,7 +1061,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     })
     if invalid_call_targets:
         raise ValueError(
-            f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling named rules, found: {', '.join(invalid_call_targets)}"
+            f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling local passes, found: {', '.join(invalid_call_targets)}"
         )
     init_vars = run_init_python(raw_python, file)
     schema = parse_schema_template(sections["schema"], None, file, init_vars)
@@ -2202,10 +2207,10 @@ def execute_instance_ops(
                 continue
             helper_def = helper_defs.get(op.helper_name)
             if helper_def is None:
-                raise ValueError(f"Unknown helper pass {op.helper_name!r}")
+                raise ValueError(f"Unknown local pass {op.helper_name!r}")
             if len(op.output_targets) != len(helper_def.output_params):
                 raise ValueError(
-                    f"Helper pass {op.helper_name} expects {len(helper_def.output_params)} outputs, got {len(op.output_targets)}"
+                    f"Local pass {op.helper_name} expects {len(helper_def.output_params)} outputs, got {len(op.output_targets)}"
                 )
             bound_outputs = {
                 param: resolve_output_sink(target, local_output_bindings, global_accs)
@@ -2214,10 +2219,10 @@ def execute_instance_ops(
             if op.input_expr.startswith("@pass:"):
                 pass_id = op.input_expr[len("@pass:"):].strip()
                 if global_pass_instances is None:
-                    raise ValueError(f"Global pass instances are not available for helper pass {op.helper_name}")
+                    raise ValueError(f"Global pass instances are not available for local pass {op.helper_name}")
                 source_instances = global_pass_instances.get(pass_id)
                 if source_instances is None:
-                    raise ValueError(f"Unknown global pass id {pass_id!r} for helper pass {op.helper_name}")
+                    raise ValueError(f"Unknown global pass id {pass_id!r} for local pass {op.helper_name}")
                 execute_pass_instance_helper(
                     helper_def,
                     source_instances,
@@ -2251,7 +2256,7 @@ def execute_instance_ops(
                 continue
             if op.helper_name in helper_defs:
                 raise ValueError(
-                    f"Local helper pass {op.helper_name!r} requires explicit output bindings; use {op.helper_name}[...](...)"
+                    f"Local pass {op.helper_name!r} requires explicit output bindings; use {op.helper_name}[...](...)"
                 )
             if external_pass_defs is None:
                 raise ValueError(f"External pass invocation is not available for {op.helper_name!r}")
@@ -2349,7 +2354,7 @@ def execute_named_pass(
             snippet = cycle_input[:80].replace("\n", "\\n").replace("\r", "\\r")
             cycle_lines.append(f"{cycle_name}({snippet!r})")
         raise ValueError(
-            "Recursive helper pass call made no progress:\n  " + "\n  ".join(cycle_lines)
+            "Recursive local pass call made no progress:\n  " + "\n  ".join(cycle_lines)
         )
 
     helper_call_stack.append(call_signature)
@@ -2374,11 +2379,11 @@ def execute_named_pass(
             matched = match_schema_nodes(item_text, pass_def.schema, 0, 0, inherited_fields, allow_trailing=True)
             if matched is None:
                 snippet = item_text[:40]
-                raise ValueError(f"Helper pass {pass_def.name} could not match near {snippet!r}")
+                raise ValueError(f"Local pass {pass_def.name} could not match near {snippet!r}")
 
             end, fields = matched
             if end <= 0:
-                raise ValueError(f"Helper pass {pass_def.name} made no progress")
+                raise ValueError(f"Local pass {pass_def.name} made no progress")
 
             counters = copy.deepcopy(state)
             counters.update(outer_counters)
@@ -2582,7 +2587,7 @@ def compile_pass_inventory(
             "outputs": outputs,
             "pass_text": block.text.strip(),
             "defines": serialize_defines(defines),
-            "rule_count": len(pass_def.local_helper_defs),
+            "local_pass_count": len(pass_def.local_helper_defs),
         })
 
     return inventory
@@ -2609,7 +2614,7 @@ def write_pass_descriptor(out_path: Path, entry: dict) -> None:
         "outputs": entry["outputs"],
         "pass_text": entry["pass_text"],
         "defines": entry.get("defines", []),
-        "rule_count": entry["rule_count"],
+        "local_pass_count": entry["local_pass_count"],
         "counts": existing_counts,
     }
     if write_text_if_changed(out_path, json.dumps(descriptor, indent=2) + "\n"):
@@ -2841,6 +2846,7 @@ def write_syntax_hints(out_path: Path, pass_names: list[str]) -> None:
 // Editor-only helper for source files that contain $ transpiler markers.
 // GCC and Clang accept '$' in identifiers, so these macros make marker
 // lines look C++-ish to editors while generated files strip them out.
+#define $local struct
 #define $pass struct
 {pass_macros}
 
@@ -3165,7 +3171,7 @@ def main(argv: list[str] | None = None) -> int:
 
     local_helper_count = sum(len(pass_def.local_helper_defs) for pass_def in pass_defs.values())
     instances_by_pass = {name: [] for name in pass_defs}
-    print(f"[codegen] Match: {len(pass_defs)} passes, {local_helper_count} rules")
+    print(f"[codegen] Match: {len(pass_defs)} passes, {local_helper_count} local passes")
 
     global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes)
     for pass_name, values in global_instances_by_pass.items():
