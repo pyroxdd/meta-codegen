@@ -585,33 +585,46 @@ def run_init_python(source: str, file: Path) -> dict:
     source = textwrap.dedent(source).strip()
     literal_assignments: dict[str, object] = {}
     if source:
-        allowed_python_lines: list[str] = []
-        for line_no, raw_line in enumerate(source.splitlines(), start=1):
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"):
+        try:
+            parsed = ast.parse(source, filename=str(file))
+        except SyntaxError as exc:
+            raise ValueError(f"Invalid raw python in $pass block in {file}: {exc}") from exc
+
+        allowed_python_chunks: list[str] = []
+        for node in parsed.body:
+            node_text = ast.get_source_segment(source, node)
+            if node_text is None:
+                lines = source.splitlines()
+                start_line = max(getattr(node, "lineno", 1) - 1, 0)
+                end_line = getattr(node, "end_lineno", getattr(node, "lineno", 1))
+                node_text = "\n".join(lines[start_line:end_line])
+
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                allowed_python_chunks.append(node_text)
                 continue
-            assign_match = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.+)", stripped)
-            if assign_match is not None:
-                name, expr = assign_match.groups()
+
+            if isinstance(node, ast.Assign):
+                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                    raise ValueError(
+                        f"Only simple literal assignments are allowed in raw python sections of $pass blocks now; "
+                        f"found {node_text!r} in {file}:{getattr(node, 'lineno', 1)}"
+                    )
                 try:
-                    literal_assignments[name] = ast.literal_eval(expr)
+                    literal_assignments[node.targets[0].id] = ast.literal_eval(node.value)
                 except Exception as exc:
                     raise ValueError(
                         f"Only literal assignments are allowed in raw python sections of $pass blocks now; "
-                        f"found {stripped!r} in {file}:{line_no}: {exc}"
+                        f"found {node_text!r} in {file}:{getattr(node, 'lineno', 1)}: {exc}"
                     ) from exc
+                allowed_python_chunks.append(node_text)
                 continue
-            if re.fullmatch(r"from\s+[A-Za-z_][\w\.]*\s+import\s+[A-Za-z_][\w\s,]*", stripped):
-                allowed_python_lines.append(stripped)
-                continue
-            if re.fullmatch(r"import\s+[A-Za-z_][\w\.]*(\s+as\s+[A-Za-z_]\w*)?", stripped):
-                allowed_python_lines.append(stripped)
-                continue
+
             raise ValueError(
                 f"Only import statements and literal assignments are allowed in raw python sections of $pass blocks now; "
-                f"found {stripped!r} in {file}:{line_no}"
+                f"found {node_text!r} in {file}:{getattr(node, 'lineno', 1)}"
             )
-        source = "\n".join(allowed_python_lines)
+
+        source = "\n".join(allowed_python_chunks)
 
     safe_builtins = {
         "__import__": __import__,
@@ -788,7 +801,7 @@ def parse_instance_section(instance_body: str) -> list[InstanceOp]:
 
     ops, end = parse_ops(0)
     if end != len(lines):
-        trailing = next((line.strip() for line in lines[end:] if line.strip()), "")
+        trailing = next((line.strip() for line in lines[end:] if line.strip() and line.strip() != "}"), "")
         if trailing:
             raise ValueError(f"Unsupported trailing instance content: {trailing!r}")
     return ops
@@ -800,6 +813,15 @@ def iter_instance_ops(ops: list[InstanceOp]):
         if op.kind == "if":
             yield from iter_instance_ops(op.true_ops or [])
             yield from iter_instance_ops(op.false_ops or [])
+
+
+def pass_calls_itself(pass_def: PassDef) -> bool:
+    if not pass_def.is_helper or pass_def.name is None:
+        return False
+    return any(
+        op.kind == "call" and op.helper_name == pass_def.name
+        for op in iter_instance_ops(pass_def.instance_ops)
+    )
 
 
 def declared_instance_aliases(ops: list[InstanceOp]) -> set[str]:
@@ -901,7 +923,7 @@ def parse_legacy_two_block_sections(block_text: str, keyword: str) -> tuple[str,
     )
 
 
-def compile_local_pass(local_pass_text: str, file: Path) -> PassDef:
+def compile_local_pass(local_pass_text: str, file: Path, inherited_init_vars: dict | None = None) -> PassDef:
     stripped_local_pass = local_pass_text.strip()
     legacy_sections = parse_legacy_two_block_sections(stripped_local_pass, "local pass")
     if legacy_sections is not None:
@@ -946,7 +968,8 @@ def compile_local_pass(local_pass_text: str, file: Path) -> PassDef:
                     f"local pass {name} may only bind variables to declared outputs {output_params} or other variables, found: {op.source_target}"
                 )
 
-    init_vars = run_init_python(raw_python, file)
+    init_vars = dict(inherited_init_vars or {})
+    init_vars.update(run_init_python(raw_python, file))
     schema = parse_schema_template(sections["schema"], name, file, init_vars)
     for label in collect_schema_branch_labels(schema):
         init_vars.setdefault(label, label)
@@ -1016,11 +1039,6 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
             raise ValueError(f"Duplicate func {func_def.name} in {file}")
         local_func_defs[func_def.name] = func_def
     body_text, local_pass_texts = extract_top_level_named_blocks(body_text, "local pass")
-    for local_pass_text in local_pass_texts:
-        local_pass_def = compile_local_pass(local_pass_text, file)
-        if local_pass_def.name in local_helper_defs:
-            raise ValueError(f"Duplicate local pass {local_pass_def.name} in {file}")
-        local_helper_defs[local_pass_def.name] = local_pass_def
     rebuilt_pass_text = first_line
     if body_text:
         rebuilt_pass_text += "\n" + body_text
@@ -1029,6 +1047,13 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     if missing:
         raise ValueError(f"Top-level $pass in {file} is missing section(s): {', '.join(missing)}")
     raw_python = sections.get("python", "")
+    init_vars = run_init_python(raw_python, file)
+
+    for local_pass_text in local_pass_texts:
+        local_pass_def = compile_local_pass(local_pass_text, file, init_vars)
+        if local_pass_def.name in local_helper_defs:
+            raise ValueError(f"Duplicate local pass {local_pass_def.name} in {file}")
+        local_helper_defs[local_pass_def.name] = local_pass_def
 
     instance_ops = parse_instance_section(sections["instance"])
     declared_aliases = declared_instance_aliases(instance_ops)
@@ -1063,7 +1088,6 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         raise ValueError(
             f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling local passes, found: {', '.join(invalid_call_targets)}"
         )
-    init_vars = run_init_python(raw_python, file)
     schema = parse_schema_template(sections["schema"], None, file, init_vars)
     enum_labels = collect_schema_branch_labels(schema)
     for helper_def in local_helper_defs.values():
@@ -2172,6 +2196,8 @@ def execute_instance_ops(
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
     helper_call_stack: list[tuple[str, str]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
+    external_pass_index_bases: dict[str, int] | None = None,
+    external_pass_generated_counts: dict[str, int] | None = None,
 ) -> None:
     helper_functions: dict[str, object] = dict(pass_def.init_vars)
     helper_functions.update(pass_def.local_func_defs)
@@ -2234,6 +2260,8 @@ def execute_instance_ops(
                     global_pass_instances,
                     helper_call_stack,
                     external_pass_defs,
+                    external_pass_index_bases,
+                    external_pass_generated_counts,
                 )
             else:
                 input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
@@ -2248,6 +2276,8 @@ def execute_instance_ops(
                     global_pass_instances,
                     helper_call_stack,
                     external_pass_defs,
+                    external_pass_index_bases,
+                    external_pass_generated_counts,
                 )
             continue
 
@@ -2275,6 +2305,8 @@ def execute_instance_ops(
                 global_pass_instances,
                 helper_call_stack,
                 external_pass_defs,
+                external_pass_index_bases,
+                external_pass_generated_counts,
             )
             continue
 
@@ -2321,6 +2353,8 @@ def execute_instance_ops(
                     global_pass_instances,
                     helper_call_stack,
                     external_pass_defs,
+                    external_pass_index_bases,
+                    external_pass_generated_counts,
                 )
             continue
 
@@ -2338,11 +2372,25 @@ def execute_named_pass(
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
     helper_call_stack: list[tuple[str, str]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
+    external_pass_index_bases: dict[str, int] | None = None,
+    external_pass_generated_counts: dict[str, int] | None = None,
 ) -> None:
     import copy
 
+    def clone_codegen_value(value):
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+    def clone_codegen_state_dict(source: dict) -> dict:
+        return {key: clone_codegen_value(value) for key, value in source.items()}
+
     if helper_call_stack is None:
         helper_call_stack = []
+
+    scoped_helper_defs = dict(helper_defs)
+    scoped_helper_defs.update(pass_def.local_helper_defs)
 
     helper_name = pass_def.name or pass_def.callable_name or "<unnamed>"
     call_signature = (helper_name, input_text)
@@ -2365,14 +2413,19 @@ def execute_named_pass(
             if isinstance(value, list):
                 continue
             if isinstance(value, (dict, set, tuple)):
-                state[key] = copy.deepcopy(value)
+                state[key] = clone_codegen_value(value)
             else:
                 state[key] = value
 
         local_index = 0
         schema_capture_names = collect_schema_capture_names(pass_def.schema)
 
-        for item_text in iter_top_level_items(input_text):
+        if pass_calls_itself(pass_def):
+            input_items = [input_text]
+        else:
+            input_items = list(iter_top_level_items(input_text))
+
+        for item_text in input_items:
             inherited_fields = outer_fields.copy()
             for capture_name in schema_capture_names:
                 inherited_fields.pop(capture_name, None)
@@ -2383,22 +2436,50 @@ def execute_named_pass(
 
             end, fields = matched
             if end <= 0:
+                if skip_c_whitespace(item_text, 0) == len(item_text):
+                    continue
                 raise ValueError(f"Local pass {pass_def.name} made no progress")
 
-            counters = copy.deepcopy(state)
+            counters = clone_codegen_state_dict(state)
             counters.update(outer_counters)
-            counters["index"] = local_index
+            external_index_base = None
+            if (
+                not pass_def.is_helper and
+                pass_def.callable_name is not None and
+                external_pass_index_bases is not None
+            ):
+                external_index_base = external_pass_index_bases.get(pass_def.callable_name)
+            generated_offset = 0
+            if (
+                not pass_def.is_helper and
+                pass_def.callable_name is not None and
+                external_pass_generated_counts is not None
+            ):
+                generated_offset = external_pass_generated_counts.get(pass_def.callable_name, 0)
+
+            if pass_def.is_helper or "index" not in outer_counters:
+                counters["index"] = local_index
+            elif external_index_base is not None:
+                counters["index"] = external_index_base + generated_offset
+            elif local_index == 0:
+                counters["index"] = outer_counters["index"]
+            else:
+                counters["index"] = outer_counters["index"] + local_index
             execute_instance_ops(
                 pass_def,
                 fields,
                 counters,
-                helper_defs,
+                scoped_helper_defs,
                 output_bindings,
                 global_accs,
                 global_pass_instances,
                 helper_call_stack,
                 external_pass_defs,
+                external_pass_index_bases,
+                external_pass_generated_counts,
             )
+            if external_pass_generated_counts is not None and not pass_def.is_helper and pass_def.callable_name is not None:
+                external_pass_generated_counts[pass_def.callable_name] = external_pass_generated_counts.get(pass_def.callable_name, 0) + 1
             local_index += 1
     finally:
         helper_call_stack.pop()
@@ -2415,22 +2496,33 @@ def execute_pass_instance_helper(
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
     helper_call_stack: list[tuple[str, str]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
+    external_pass_index_bases: dict[str, int] | None = None,
+    external_pass_generated_counts: dict[str, int] | None = None,
 ) -> None:
     import copy
+
+    def clone_codegen_value(value):
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+    def clone_codegen_state_dict(source: dict) -> dict:
+        return {key: clone_codegen_value(value) for key, value in source.items()}
 
     state = {}
     for key, value in pass_def.init_vars.items():
         if isinstance(value, list):
             continue
         if isinstance(value, (dict, set, tuple)):
-            state[key] = copy.deepcopy(value)
+            state[key] = clone_codegen_value(value)
         else:
             state[key] = value
 
     for local_index, instance_fields in enumerate(source_instances):
         fields = outer_fields.copy()
         fields.update(instance_fields)
-        counters = copy.deepcopy(state)
+        counters = clone_codegen_state_dict(state)
         counters.update(outer_counters)
         counters["index"] = local_index
         execute_instance_ops(
@@ -2443,6 +2535,8 @@ def execute_pass_instance_helper(
             global_pass_instances,
             helper_call_stack,
             external_pass_defs,
+            external_pass_index_bases,
+            external_pass_generated_counts,
         )
 
 
@@ -2453,15 +2547,26 @@ def render_fragments(
     index_base_expr: str | None = None,
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
+    external_pass_index_bases: dict[str, int] | None = None,
+    external_pass_generated_counts: dict[str, int] | None = None,
 ) -> dict[str, str]:
     import copy
+
+    def clone_codegen_value(value):
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+    
+    def clone_codegen_state_dict(source: dict) -> dict:
+        return {key: clone_codegen_value(value) for key, value in source.items()}
 
     state = {}
     for key, value in pass_def.init_vars.items():
         if isinstance(value, list):
             continue
         if isinstance(value, (dict, set, tuple)):
-            state[key] = copy.deepcopy(value)
+            state[key] = clone_codegen_value(value)
         else:
             state[key] = value
     counters = state
@@ -2478,7 +2583,7 @@ def render_fragments(
             counters["index"] = SymbolicExpr(index_base_expr)
         else:
             counters["index"] = SymbolicExpr(f"({index_base_expr} + {index})")
-        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs, global_pass_instances, None, external_pass_defs)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs, global_pass_instances, None, external_pass_defs, external_pass_index_bases, external_pass_generated_counts)
 
     fragments = {}
     for key, value in accs.items():
@@ -2754,6 +2859,7 @@ def write_pass_file_shards(
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
     rendered_fragments: dict[str, str] | None = None,
+    instance_count_override: int | None = None,
 ) -> list[Path]:
     fragment_names = collect_declared_output_targets(pass_def.instance_ops)
     written_paths: list[Path] = []
@@ -2787,7 +2893,7 @@ def write_pass_file_shards(
             if delete_file_if_exists(out_path):
                 print(f"Removed empty fragment: {out_path}")
 
-    update_pass_count(build_root, entry["id"], rel_file, len(instances))
+    update_pass_count(build_root, entry["id"], rel_file, len(instances) if instance_count_override is None else instance_count_override)
 
     return written_paths
 
@@ -3078,6 +3184,7 @@ def main(argv: list[str] | None = None) -> int:
             for _, pass_def in loaded_passes
             if pass_def.callable_name is not None
         }
+        external_pass_generated_counts: dict[str, int] = {}
         output_owner_by_fragment = build_output_owner_map(loaded_passes)
         global_instances_by_pass = collect_instances_by_pass(shared_root, pass_defs, tuple(DEFAULT_SOURCE_SUFFIXES))
         instances_by_pass = {entry["id"]: [] for entry, _ in loaded_passes}
@@ -3090,6 +3197,15 @@ def main(argv: list[str] | None = None) -> int:
 
             pass_id, values = identify_pass(block, pass_defs)
             instances_by_pass[pass_id].append(values)
+
+        external_pass_index_bases = {
+            pass_def.callable_name: (
+                compute_index_base(entry, rel_from_shared_root, rel_source_files) +
+                len(instances_by_pass[entry["id"]])
+            )
+            for entry, pass_def in loaded_passes
+            if pass_def.callable_name is not None
+        }
 
         stripped_out = strip_marker_blocks(source, strip_blocks)
         shared_out_path = args.shared_output_root / rel_from_shared_parent
@@ -3107,6 +3223,8 @@ def main(argv: list[str] | None = None) -> int:
                 str(index_base),
                 global_instances_by_pass,
                 external_pass_defs,
+                external_pass_index_bases,
+                external_pass_generated_counts,
             )
             for fragment_name, content in rendered.items():
                 owner_pass_id = output_owner_by_fragment.get(fragment_name)
@@ -3116,6 +3234,18 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 existing = rendered_fragments_by_pass[owner_pass_id].get(fragment_name, "")
                 rendered_fragments_by_pass[owner_pass_id][fragment_name] = existing + content
+
+        callable_name_to_pass_id = {
+            pass_def.callable_name: entry["id"]
+            for entry, pass_def in loaded_passes
+            if pass_def.callable_name is not None
+        }
+        generated_count_by_pass_id: dict[str, int] = {}
+        for callable_name, count in external_pass_generated_counts.items():
+            pass_id = callable_name_to_pass_id.get(callable_name)
+            if pass_id is None:
+                continue
+            generated_count_by_pass_id[pass_id] = generated_count_by_pass_id.get(pass_id, 0) + count
 
         for entry, pass_def in loaded_passes:
             write_pass_file_shards(
@@ -3129,6 +3259,7 @@ def main(argv: list[str] | None = None) -> int:
                 global_instances_by_pass,
                 external_pass_defs,
                 rendered_fragments_by_pass[entry["id"]],
+                len(instances_by_pass[entry["id"]]) + generated_count_by_pass_id.get(entry["id"], 0),
             )
 
         matched_pass_count = sum(1 for instances in instances_by_pass.values() if instances)
@@ -3181,6 +3312,12 @@ def main(argv: list[str] | None = None) -> int:
         for pass_def in pass_defs.values()
         if pass_def.callable_name is not None
     }
+    external_pass_index_bases = {
+        pass_def.callable_name: 0
+        for pass_def in pass_defs.values()
+        if pass_def.callable_name is not None
+    }
+    external_pass_generated_counts: dict[str, int] = {}
 
     output_root.mkdir(parents=True, exist_ok=True)
     total_instances = sum(len(instances) for instances in instances_by_pass.values())
@@ -3192,6 +3329,8 @@ def main(argv: list[str] | None = None) -> int:
             pass_def.local_helper_defs,
             global_pass_instances=global_instances_by_pass,
             external_pass_defs=external_pass_defs,
+            external_pass_index_bases=external_pass_index_bases,
+            external_pass_generated_counts=external_pass_generated_counts,
         )
         folder_name = default_pass_output_name(pass_def, name)
         for fragment_name, content in fragments.items():
