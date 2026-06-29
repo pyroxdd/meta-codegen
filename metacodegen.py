@@ -2456,6 +2456,10 @@ def execute_named_pass(
                 external_pass_generated_counts is not None
             ):
                 generated_offset = external_pass_generated_counts.get(pass_def.callable_name, 0)
+                # Reserve the current generated slot before executing the item so
+                # recursive named-pass calls allocate indices after this node
+                # instead of colliding with it.
+                external_pass_generated_counts[pass_def.callable_name] = generated_offset + 1
 
             if pass_def.is_helper or "index" not in outer_counters:
                 counters["index"] = local_index
@@ -2478,8 +2482,6 @@ def execute_named_pass(
                 external_pass_index_bases,
                 external_pass_generated_counts,
             )
-            if external_pass_generated_counts is not None and not pass_def.is_helper and pass_def.callable_name is not None:
-                external_pass_generated_counts[pass_def.callable_name] = external_pass_generated_counts.get(pass_def.callable_name, 0) + 1
             local_index += 1
     finally:
         helper_call_stack.pop()
@@ -2884,14 +2886,15 @@ def write_pass_file_shards(
         out_path = output_root / fragment_header_rel_output_path(entry, rel_output, rel_file)
         content = rendered_fragments.get(fragment_name, "").rstrip()
         if content:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
             content += "\n"
-            if write_text_if_changed(out_path, content):
-                print(f"Written: {out_path}")
-            written_paths.append(out_path)
         else:
-            if delete_file_if_exists(out_path):
-                print(f"Removed empty fragment: {out_path}")
+            # Keep declared fragment outputs on disk even when they are empty so
+            # the build graph can treat them as satisfied byproducts.
+            content = "#pragma once\n"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if write_text_if_changed(out_path, content):
+            print(f"Written: {out_path}")
+        written_paths.append(out_path)
 
     update_pass_count(build_root, entry["id"], rel_file, len(instances) if instance_count_override is None else instance_count_override)
 
