@@ -2702,15 +2702,6 @@ def compile_pass_inventory(
 
 def write_pass_descriptor(out_path: Path, entry: dict) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_counts: dict[str, int] = {}
-    if out_path.exists():
-        try:
-            existing = json.loads(out_path.read_text())
-            raw_counts = existing.get("counts", {})
-            if isinstance(raw_counts, dict):
-                existing_counts = {str(key): int(value) for key, value in raw_counts.items()}
-        except Exception:
-            existing_counts = {}
     descriptor = {
         "id": entry["id"],
         "callable_name": entry.get("callable_name"),
@@ -2722,7 +2713,6 @@ def write_pass_descriptor(out_path: Path, entry: dict) -> None:
         "pass_text": entry["pass_text"],
         "defines": entry.get("defines", []),
         "local_pass_count": entry["local_pass_count"],
-        "counts": existing_counts,
     }
     if write_text_if_changed(out_path, json.dumps(descriptor, indent=2) + "\n"):
         print(f"Written: {out_path}")
@@ -2799,15 +2789,28 @@ def fragment_header_rel_output_path(entry: dict, rel_output: str, rel_file: Path
     return output_subdir_rel_path(rel_output) / entry["id"] / f"{sanitize_path_token(rel_file)}.h"
 
 
-def read_instance_count(entry: dict, rel_file: Path) -> int:
-    raw_counts = entry.get("counts", {})
-    if not isinstance(raw_counts, dict):
+def pass_count_rel_path(pass_id: str, rel_file: Path) -> Path:
+    return Path("counts") / pass_id / f"{sanitize_path_token(rel_file)}.json"
+
+
+def pass_count_path(build_root: Path, pass_id: str, rel_file: Path) -> Path:
+    return build_root / pass_count_rel_path(pass_id, rel_file)
+
+
+def read_instance_count(build_root: Path, pass_id: str, rel_file: Path) -> int:
+    count_path = pass_count_path(build_root, pass_id, rel_file)
+    if not count_path.exists():
         return 0
-    return int(raw_counts.get(rel_file.as_posix(), 0))
+    try:
+        data = json.loads(count_path.read_text())
+        return int(data.get("count", 0))
+    except Exception:
+        return 0
 
 
 def compute_index_base(
     entry: dict,
+    build_root: Path,
     rel_file: Path,
     rel_source_files: list[Path],
 ) -> int:
@@ -2815,7 +2818,7 @@ def compute_index_base(
     for candidate in rel_source_files:
         if candidate == rel_file:
             break
-        total += read_instance_count(entry, candidate)
+        total += read_instance_count(build_root, entry["id"], candidate)
     return total
 
 
@@ -2838,16 +2841,14 @@ def build_output_owner_map(loaded_passes: list[tuple[dict, PassDef]]) -> dict[st
 
 
 def update_pass_count(build_root: Path, pass_id: str, rel_file: Path, count: int) -> None:
-    descriptor_path = build_root / f"pass_{pass_id}.json"
-    data = json.loads(descriptor_path.read_text())
-    counts = data.setdefault("counts", {})
-    rel_key = rel_file.as_posix()
-    if count == 0:
-        counts.pop(rel_key, None)
-    else:
-        counts[rel_key] = count
-    if write_text_if_changed(descriptor_path, json.dumps(data, indent=2) + "\n"):
-        print(f"Written: {descriptor_path}")
+    count_path = pass_count_path(build_root, pass_id, rel_file)
+    data = {
+        "pass_id": pass_id,
+        "file": rel_file.as_posix(),
+        "count": int(count),
+    }
+    if write_text_if_changed(count_path, json.dumps(data, indent=2) + "\n"):
+        print(f"Written: {count_path}")
 
 
 def write_pass_file_shards(
@@ -2872,7 +2873,7 @@ def write_pass_file_shards(
         )
 
     if rendered_fragments is None:
-        index_base = compute_index_base(entry, rel_file, rel_source_files)
+        index_base = compute_index_base(entry, build_root, rel_file, rel_source_files)
         rendered_fragments = render_fragments(
             pass_def,
             instances,
@@ -3203,7 +3204,7 @@ def main(argv: list[str] | None = None) -> int:
 
         external_pass_index_bases = {
             pass_def.callable_name: (
-                compute_index_base(entry, rel_from_shared_root, rel_source_files) +
+                compute_index_base(entry, build_root, rel_from_shared_root, rel_source_files) +
                 len(instances_by_pass[entry["id"]])
             )
             for entry, pass_def in loaded_passes
@@ -3218,7 +3219,7 @@ def main(argv: list[str] | None = None) -> int:
 
         rendered_fragments_by_pass: dict[str, dict[str, str]] = {entry["id"]: {} for entry, _ in loaded_passes}
         for entry, pass_def in loaded_passes:
-            index_base = compute_index_base(entry, rel_from_shared_root, rel_source_files)
+            index_base = compute_index_base(entry, build_root, rel_from_shared_root, rel_source_files)
             rendered = render_fragments(
                 pass_def,
                 instances_by_pass[entry["id"]],
