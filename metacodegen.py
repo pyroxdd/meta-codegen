@@ -1106,9 +1106,9 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         init_vars=init_vars,
         output_params=output_params,
         instance_targets=list(dict.fromkeys(
-            normalize_output_target(op.target)
+            output_target_key(op.target)
             for op in iter_instance_ops(instance_ops)
-            if op.kind == "emit" and op.target is not None and op.target not in declared_aliases
+            if op.kind == "emit" and op.target is not None and op.target not in declared_aliases and parse_output_target(op.target) is not None
         )),
         instance_ops=instance_ops,
         is_helper=False,
@@ -1633,7 +1633,7 @@ def default_pass_output_name(pass_def: PassDef, fallback: str) -> str:
     if pass_def.name:
         return pass_def.name
     if pass_def.instance_targets:
-        tokenized = [target.split("_") for target in pass_def.instance_targets]
+        tokenized = [output_target_display_name(target).split("_") for target in pass_def.instance_targets]
         prefix: list[str] = []
         for parts in zip(*tokenized):
             if len(set(parts)) != 1:
@@ -1659,26 +1659,69 @@ def sanitize_path_token(path: Path | str) -> str:
     return text.lower() or "pass"
 
 
-def normalize_output_target(target: str) -> str:
-    return target[4:] if target.startswith("out.") else target
+def parse_output_target(target: str) -> tuple[str, str] | None:
+    if target.startswith("out."):
+        return ("header", target[4:])
+    if target.startswith("source."):
+        return ("source", target[7:])
+    return None
+
+
+def output_target_key(target: str) -> str:
+    spec = parse_output_target(target)
+    if spec is None:
+        return target
+    kind, name = spec
+    return f"{kind}:{name}"
+
+
+def output_target_display_name(target_or_key: str) -> str:
+    spec = parse_output_target(target_or_key)
+    if spec is not None:
+        return spec[1]
+    if ":" in target_or_key:
+        return target_or_key.split(":", 1)[1]
+    return target_or_key
+
+
+def rel_output_path_for_target(
+    target: str,
+    generated_header_root: str,
+    generated_header_prefix: str,
+    generated_source_root: str,
+    generated_source_prefix: str,
+) -> Path:
+    spec = parse_output_target(target)
+    if spec is None:
+        return Path(target)
+    kind, name = spec
+    if kind == "header":
+        rel_output = Path(f"{generated_header_prefix}{name}.h")
+        if generated_header_root:
+            rel_output = Path(generated_header_root) / rel_output
+        return rel_output
+    rel_output = Path(f"{generated_source_prefix}{name}.cpp")
+    if generated_source_root:
+        rel_output = Path(generated_source_root) / rel_output
+    return rel_output
 
 
 def collect_declared_output_targets(instance_ops: list[InstanceOp]) -> list[str]:
     targets: list[str] = []
     for op in iter_instance_ops(instance_ops):
-        if op.kind == "emit" and op.target is not None and op.target.startswith("out."):
-            targets.append(normalize_output_target(op.target))
-        elif op.kind == "assign" and op.source_target is not None and op.source_target.startswith("out."):
-            targets.append(normalize_output_target(op.source_target))
+        if op.kind == "emit" and op.target is not None and parse_output_target(op.target) is not None:
+            targets.append(op.target)
+        elif op.kind == "assign" and op.source_target is not None and parse_output_target(op.source_target) is not None:
+            targets.append(op.source_target)
         elif op.kind == "call" and op.output_targets is not None:
             for target in op.output_targets:
-                if target.startswith("out."):
-                    targets.append(normalize_output_target(target))
+                if parse_output_target(target) is not None:
+                    targets.append(target)
     return list(dict.fromkeys(targets))
 
 
 def target_is_allowed(target: str, declared_aliases: set[str]) -> bool:
-    return target.startswith("out.") or target in declared_aliases
+    return parse_output_target(target) is not None or target in declared_aliases
 
 
 def resolve_output_sink(
@@ -1688,11 +1731,11 @@ def resolve_output_sink(
 ) -> list[str]:
     if target in local_output_bindings:
         return local_output_bindings[target]
-    if target.startswith("out."):
-        normalized = normalize_output_target(target)
+    if parse_output_target(target) is not None:
+        normalized = output_target_key(target)
         return global_accs.setdefault(normalized, [])
     raise ValueError(
-        f"Unknown output target {target!r}; use a declared named-pass output parameter or an 'out.<name>' global output"
+        f"Unknown output target {target!r}; use a declared named-pass output parameter or a global output like 'out.<name>' or 'source.<name>'"
     )
 
 
@@ -2646,6 +2689,8 @@ def compile_pass_inventory(
     passes_dir: Path,
     generated_header_root: str,
     generated_header_prefix: str,
+    generated_source_root: str,
+    generated_source_prefix: str,
     source_suffixes: tuple[str, ...],
     defines: dict[str, str],
 ) -> list[dict]:
@@ -2670,10 +2715,15 @@ def compile_pass_inventory(
         pass_name = sanitize_path_token(rel_file.stem)
         pass_id = pass_name
         outputs = []
-        for fragment_name in collect_declared_output_targets(pass_def.instance_ops):
-            rel_output = Path(f"{generated_header_prefix}{fragment_name}.h")
-            if generated_header_root:
-                rel_output = Path(generated_header_root) / rel_output
+        output_targets = collect_declared_output_targets(pass_def.instance_ops)
+        for target in output_targets:
+            rel_output = rel_output_path_for_target(
+                target,
+                generated_header_root,
+                generated_header_prefix,
+                generated_source_root,
+                generated_source_prefix,
+            )
             outputs.append(rel_output.as_posix())
 
         if pass_def.callable_name is not None:
@@ -2692,6 +2742,7 @@ def compile_pass_inventory(
             "block_index_in_file": 0,
             "folder": pass_name,
             "outputs": outputs,
+            "output_targets": output_targets,
             "pass_text": block.text.strip(),
             "defines": serialize_defines(defines),
             "local_pass_count": len(pass_def.local_helper_defs),
@@ -2710,6 +2761,7 @@ def write_pass_descriptor(out_path: Path, entry: dict) -> None:
         "block_index_in_file": entry["block_index_in_file"],
         "folder": entry["folder"],
         "outputs": entry["outputs"],
+        "output_targets": entry.get("output_targets", []),
         "pass_text": entry["pass_text"],
         "defines": entry.get("defines", []),
         "local_pass_count": entry["local_pass_count"],
@@ -2822,21 +2874,34 @@ def compute_index_base(
     return total
 
 
-def fragment_name_from_rel_output(rel_output: str) -> str:
-    return Path(rel_output).stem
+def output_key_from_rel_output(rel_output: str) -> str:
+    rel_path = Path(rel_output)
+    if rel_path.suffix == ".cpp":
+        return f"source:{rel_path.stem}"
+    return f"header:{rel_path.stem}"
 
 
 def build_output_owner_map(loaded_passes: list[tuple[dict, PassDef]]) -> dict[str, str]:
     owners: dict[str, str] = {}
     for entry, _ in loaded_passes:
-        for rel_output in entry.get("outputs", []):
-            fragment_name = fragment_name_from_rel_output(rel_output)
-            existing_owner = owners.get(fragment_name)
+        output_targets = entry.get("output_targets", [])
+        outputs = entry.get("outputs", [])
+        if output_targets and len(output_targets) != len(outputs):
+            raise ValueError(
+                f"Pass descriptor {entry['id']!r} has mismatched outputs/output_targets lengths: {len(outputs)} vs {len(output_targets)}"
+            )
+        for index, rel_output in enumerate(outputs):
+            output_key = (
+                output_target_key(output_targets[index])
+                if index < len(output_targets)
+                else output_key_from_rel_output(rel_output)
+            )
+            existing_owner = owners.get(output_key)
             if existing_owner is not None and existing_owner != entry["id"]:
                 raise ValueError(
-                    f"Fragment output {fragment_name!r} is owned by multiple passes: {existing_owner!r} and {entry['id']!r}"
+                    f"Fragment output {output_key!r} is owned by multiple passes: {existing_owner!r} and {entry['id']!r}"
                 )
-            owners[fragment_name] = entry["id"]
+            owners[output_key] = entry["id"]
     return owners
 
 
@@ -2864,12 +2929,12 @@ def write_pass_file_shards(
     rendered_fragments: dict[str, str] | None = None,
     instance_count_override: int | None = None,
 ) -> list[Path]:
-    fragment_names = collect_declared_output_targets(pass_def.instance_ops)
+    output_targets = entry.get("output_targets", collect_declared_output_targets(pass_def.instance_ops))
     written_paths: list[Path] = []
     outputs = entry.get("outputs", [])
-    if len(outputs) != len(fragment_names):
+    if len(outputs) != len(output_targets):
         raise ValueError(
-            f"Manifest outputs for pass {entry['id']} do not match fragment count: {len(outputs)} vs {len(fragment_names)}"
+            f"Manifest outputs for pass {entry['id']} do not match output target count: {len(outputs)} vs {len(output_targets)}"
         )
 
     if rendered_fragments is None:
@@ -2883,9 +2948,9 @@ def write_pass_file_shards(
             external_pass_defs,
         )
 
-    for rel_output, fragment_name in zip(outputs, fragment_names):
+    for rel_output, target in zip(outputs, output_targets):
         out_path = output_root / fragment_header_rel_output_path(entry, rel_output, rel_file)
-        content = rendered_fragments.get(fragment_name, "").rstrip()
+        content = rendered_fragments.get(output_target_key(target), "").rstrip()
         if content:
             content += "\n"
         else:
@@ -2911,10 +2976,16 @@ def write_public_output_headers(entries: list[dict], output_root: Path) -> list[
 
     for rel_output, output_entries in outputs_to_entries.items():
         out_path = aggregate_output_path(output_root, rel_output)
-        lines = ["#pragma once", ""]
+        lines: list[str] = []
+        if out_path.suffix == ".h":
+            lines.extend(["#pragma once", ""])
         for entry in output_entries:
             lines.append(f'#include "{pass_header_rel_output_path(entry, rel_output).as_posix()}"')
-        content = "\n".join(lines).rstrip() + "\n"
+        content = "\n".join(lines).rstrip()
+        if content:
+            content += "\n"
+        elif out_path.suffix == ".h":
+            content = "#pragma once\n"
         if write_text_if_changed(out_path, content):
             print(f"Written: {out_path}")
         written_paths.append(out_path)
@@ -2989,6 +3060,16 @@ def parse_compile_passes_args(argv: list[str]) -> argparse.Namespace:
         "--generated-header-root",
         default="",
         help="Optional directory prefix for generated fragment headers, e.g. g",
+    )
+    parser.add_argument(
+        "--generated-source-prefix",
+        default="",
+        help="Optional prefix added to generated public source filenames; defaults to the header prefix",
+    )
+    parser.add_argument(
+        "--generated-source-root",
+        default="",
+        help="Optional directory prefix for generated public source files, e.g. g; defaults to the header root",
     )
     parser.add_argument(
         "--source-suffix",
@@ -3075,6 +3156,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             stamp=Path(argv[2]) / "content.stamp",
             generated_header_prefix="",
             generated_header_root="",
+            generated_source_prefix="",
+            generated_source_root="",
             syntax_hints=None,
             no_syntax_hints=False,
             source_suffixes=list(DEFAULT_SOURCE_SUFFIXES),
@@ -3118,6 +3201,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Optional directory under the output root where generated fragment headers are organized by pass, e.g. g/tile/textures.h",
     )
     parser.add_argument(
+        "--generated-source-prefix",
+        default="",
+        help="Optional prefix added to generated public source filenames; defaults to the header prefix",
+    )
+    parser.add_argument(
+        "--generated-source-root",
+        default="",
+        help="Optional directory under the output root where generated public source files are organized; defaults to the header root",
+    )
+    parser.add_argument(
         "--syntax-hints",
         type=Path,
         default=None,
@@ -3150,6 +3243,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     define_map = parse_define_args(getattr(args, "defines", []))
+    generated_source_root = getattr(args, "generated_source_root", "") or getattr(args, "generated_header_root", "")
+    generated_source_prefix = getattr(args, "generated_source_prefix", "") or getattr(args, "generated_header_prefix", "")
     if args.command == "compile-passes":
         source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
         print(f"[codegen] Compile passes: {args.passes_dir}")
@@ -3157,6 +3252,8 @@ def main(argv: list[str] | None = None) -> int:
             args.passes_dir,
             args.generated_header_root,
             args.generated_header_prefix,
+            generated_source_root,
+            generated_source_prefix,
             source_suffixes,
             define_map,
         )
@@ -3336,15 +3433,18 @@ def main(argv: list[str] | None = None) -> int:
             external_pass_index_bases=external_pass_index_bases,
             external_pass_generated_counts=external_pass_generated_counts,
         )
-        folder_name = default_pass_output_name(pass_def, name)
-        for fragment_name, content in fragments.items():
-            if args.generated_header_root:
-                out_path = output_root / args.generated_header_root / folder_name / f"{args.generated_header_prefix}{fragment_name}.h"
-            else:
-                out_path = output_root / f"{args.generated_header_prefix}{fragment_name}.h"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(content)
-            print(f"Written: {out_path}")
+        for target in collect_declared_output_targets(pass_def.instance_ops):
+            rel_output = rel_output_path_for_target(
+                target,
+                args.generated_header_root,
+                args.generated_header_prefix,
+                generated_source_root,
+                generated_source_prefix,
+            )
+            out_path = output_root / rel_output
+            content = fragments.get(output_target_key(target), "")
+            if write_text_if_changed(out_path, content):
+                print(f"Written: {out_path}")
 
     print(f"[codegen] Rewrite: stripped shared sources -> {shared_output_root}")
     write_generated_sources(shared_dir, strip_map, shared_output_root, source_suffixes)
