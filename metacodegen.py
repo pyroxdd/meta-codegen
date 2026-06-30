@@ -12,6 +12,7 @@ Pass authoring note for future developers:
 
 import argparse
 import ast
+import hashlib
 import json
 import re
 import sys
@@ -813,6 +814,15 @@ def iter_instance_ops(ops: list[InstanceOp]):
         if op.kind == "if":
             yield from iter_instance_ops(op.true_ops or [])
             yield from iter_instance_ops(op.false_ops or [])
+
+
+def pass_uses_global_pass_instances(pass_def: PassDef) -> bool:
+    return any(
+        op.kind == "call" and
+        op.input_expr is not None and
+        op.input_expr.startswith("@pass:")
+        for op in iter_instance_ops(pass_def.instance_ops)
+    )
 
 
 def pass_calls_itself(pass_def: PassDef) -> bool:
@@ -1657,6 +1667,14 @@ def sanitize_path_token(path: Path | str) -> str:
     text = re.sub(r"[^A-Za-z0-9]+", "_", text)
     text = re.sub(r"_+", "_", text).strip("_")
     return text.lower() or "pass"
+
+
+def stable_json_dumps(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def hash_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
 def parse_output_target(target: str) -> tuple[str, str] | None:
@@ -2849,6 +2867,87 @@ def pass_count_path(build_root: Path, pass_id: str, rel_file: Path) -> Path:
     return build_root / pass_count_rel_path(pass_id, rel_file)
 
 
+def process_state_rel_path(rel_file: Path) -> Path:
+    return Path("process_state") / f"{sanitize_path_token(rel_file)}.json"
+
+
+def process_state_path(build_root: Path, rel_file: Path) -> Path:
+    return build_root / process_state_rel_path(rel_file)
+
+
+def load_process_state(build_root: Path, rel_file: Path) -> dict | None:
+    state_path = process_state_path(build_root, rel_file)
+    if not state_path.exists():
+        return None
+    try:
+        return json.loads(state_path.read_text())
+    except Exception:
+        return None
+
+
+def write_process_state(build_root: Path, rel_file: Path, state: dict) -> None:
+    state_path = process_state_path(build_root, rel_file)
+    if write_text_if_changed(state_path, json.dumps(state, indent=2) + "\n"):
+        print(f"Written: {state_path}")
+
+
+def zero_count_map(pass_ids: list[str]) -> dict[str, int]:
+    return {pass_id: 0 for pass_id in pass_ids}
+
+
+def build_loaded_pass_descriptor_fingerprint(loaded_passes: list[tuple[dict, PassDef]]) -> str:
+    descriptor_entries = []
+    for entry, _ in loaded_passes:
+        descriptor_entries.append({
+            "id": entry["id"],
+            "outputs": entry.get("outputs", []),
+            "output_targets": entry.get("output_targets", []),
+            "pass_text": entry.get("pass_text", ""),
+            "defines": entry.get("defines", []),
+            "local_pass_count": entry.get("local_pass_count", 0),
+        })
+    return hash_text(stable_json_dumps(descriptor_entries))
+
+
+def build_process_state_fingerprint(
+    rel_file: Path,
+    source_text: str,
+    loaded_pass_fingerprint: str,
+    prefix_state_fingerprint: str,
+) -> str:
+    payload = {
+        "file": rel_file.as_posix(),
+        "source_sha1": hash_text(source_text),
+        "passes_sha1": loaded_pass_fingerprint,
+        "prefix_state_sha1": prefix_state_fingerprint,
+    }
+    return hash_text(stable_json_dumps(payload))
+
+
+def build_next_prefix_state_fingerprint(prefix_state_fingerprint: str, local_count_map: dict[str, int]) -> str:
+    payload = {
+        "prefix_state_sha1": prefix_state_fingerprint,
+        "local_counts": local_count_map,
+    }
+    return hash_text(stable_json_dumps(payload))
+
+
+def process_file_expected_outputs(
+    loaded_passes: list[tuple[dict, PassDef]],
+    rel_file: Path,
+    shared_out_path: Path,
+    output_root: Path,
+    build_root: Path,
+) -> list[Path]:
+    expected = [shared_out_path]
+    for entry, _ in loaded_passes:
+        for rel_output in entry.get("outputs", []):
+            expected.append(output_root / fragment_header_rel_output_path(entry, rel_output, rel_file))
+        expected.append(pass_count_path(build_root, entry["id"], rel_file))
+    expected.append(process_state_path(build_root, rel_file))
+    return expected
+
+
 def read_instance_count(build_root: Path, pass_id: str, rel_file: Path) -> int:
     count_path = pass_count_path(build_root, pass_id, rel_file)
     if not count_path.exists():
@@ -3247,7 +3346,6 @@ def main(argv: list[str] | None = None) -> int:
     generated_source_prefix = getattr(args, "generated_source_prefix", "") or getattr(args, "generated_header_prefix", "")
     if args.command == "compile-passes":
         source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
-        print(f"[codegen] Compile passes: {args.passes_dir}")
         entries = compile_pass_inventory(
             args.passes_dir,
             args.generated_header_root,
@@ -3263,31 +3361,28 @@ def main(argv: list[str] | None = None) -> int:
             write_pass_descriptor(descriptor_path, entry)
         if args.shared_dir is not None and args.output_root is not None:
             write_public_output_headers(entries, args.output_root.resolve())
-        print(f"[codegen] Compiled {len(entries)} passes")
         return 0
     if args.command == "process-file":
         shared_root = args.shared_root.resolve()
         input_file = args.input.resolve()
         build_root = args.build_root.resolve()
+        shared_output_root = args.shared_output_root.resolve()
         rel_source_files = [
             file.relative_to(shared_root)
             for file in iter_source_files(shared_root, tuple(DEFAULT_SOURCE_SUFFIXES))
         ]
         rel_from_shared_parent = input_file.relative_to(shared_root.parent)
         rel_from_shared_root = input_file.relative_to(shared_root)
-        print(f"[codegen] Process file: {rel_from_shared_root.as_posix()}")
         loaded_passes = load_pass_defs_from_build_root(build_root)
         blocks, strip_blocks, source = discover_blocks_in_file(input_file)
 
+        pass_ids = [entry["id"] for entry, _ in loaded_passes]
         pass_defs = {entry["id"]: pass_def for entry, pass_def in loaded_passes}
         external_pass_defs = {
             pass_def.callable_name: pass_def
             for _, pass_def in loaded_passes
             if pass_def.callable_name is not None
         }
-        external_pass_generated_counts: dict[str, int] = {}
-        output_owner_by_fragment = build_output_owner_map(loaded_passes)
-        global_instances_by_pass = collect_instances_by_pass(shared_root, pass_defs, tuple(DEFAULT_SOURCE_SUFFIXES))
         instances_by_pass = {entry["id"]: [] for entry, _ in loaded_passes}
 
         for block in blocks:
@@ -3299,9 +3394,57 @@ def main(argv: list[str] | None = None) -> int:
             pass_id, values = identify_pass(block, pass_defs)
             instances_by_pass[pass_id].append(values)
 
+        source_file_index = rel_source_files.index(rel_from_shared_root)
+        prev_rel_file = rel_source_files[source_file_index - 1] if source_file_index > 0 else None
+        prefix_count_by_pass_id = zero_count_map(pass_ids)
+        prefix_state_fingerprint = "root"
+        if prev_rel_file is not None:
+            prev_state = load_process_state(build_root, prev_rel_file)
+            if prev_state is not None:
+                prefix_state_fingerprint = prev_state.get("state_fingerprint", "root")
+                for pass_id in pass_ids:
+                    prefix_count_by_pass_id[pass_id] = int(prev_state.get("cumulative_counts", {}).get(pass_id, 0))
+            else:
+                for entry, _ in loaded_passes:
+                    prefix_count_by_pass_id[entry["id"]] = compute_index_base(entry, build_root, rel_from_shared_root, rel_source_files)
+                prefix_state_fingerprint = hash_text(stable_json_dumps(prefix_count_by_pass_id))
+
+        loaded_pass_fingerprint = build_loaded_pass_descriptor_fingerprint(loaded_passes)
+        current_input_fingerprint = build_process_state_fingerprint(
+            rel_from_shared_root,
+            source,
+            loaded_pass_fingerprint,
+            prefix_state_fingerprint,
+        )
+        shared_out_path = shared_output_root / rel_from_shared_parent
+        current_state = load_process_state(build_root, rel_from_shared_root)
+        uses_global_instances = any(
+            pass_uses_global_pass_instances(pass_def)
+            for _, pass_def in loaded_passes
+        )
+        if (
+            not uses_global_instances and
+            current_state is not None and
+            current_state.get("input_fingerprint") == current_input_fingerprint and
+            all(path.exists() for path in process_file_expected_outputs(
+                loaded_passes,
+                rel_from_shared_root,
+                shared_out_path,
+                shared_output_root,
+                build_root,
+            ))
+        ):
+            return 0
+
+        external_pass_generated_counts: dict[str, int] = {}
+        output_owner_by_fragment = build_output_owner_map(loaded_passes)
+        global_instances_by_pass = None
+        if uses_global_instances:
+            global_instances_by_pass = collect_instances_by_pass(shared_root, pass_defs, tuple(DEFAULT_SOURCE_SUFFIXES))
+
         external_pass_index_bases = {
             pass_def.callable_name: (
-                compute_index_base(entry, build_root, rel_from_shared_root, rel_source_files) +
+                prefix_count_by_pass_id[entry["id"]] +
                 len(instances_by_pass[entry["id"]])
             )
             for entry, pass_def in loaded_passes
@@ -3309,14 +3452,13 @@ def main(argv: list[str] | None = None) -> int:
         }
 
         stripped_out = strip_marker_blocks(source, strip_blocks)
-        shared_out_path = args.shared_output_root / rel_from_shared_parent
         shared_out_path.parent.mkdir(parents=True, exist_ok=True)
         if write_text_if_changed(shared_out_path, stripped_out):
             print(f"Written: {shared_out_path}")
 
         rendered_fragments_by_pass: dict[str, dict[str, str]] = {entry["id"]: {} for entry, _ in loaded_passes}
         for entry, pass_def in loaded_passes:
-            index_base = compute_index_base(entry, build_root, rel_from_shared_root, rel_source_files)
+            index_base = prefix_count_by_pass_id[entry["id"]]
             rendered = render_fragments(
                 pass_def,
                 instances_by_pass[entry["id"]],
@@ -3354,7 +3496,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass_def,
                 rel_from_shared_root,
                 instances_by_pass[entry["id"]],
-                args.shared_output_root.resolve(),
+                shared_output_root,
                 build_root,
                 rel_source_files,
                 global_instances_by_pass,
@@ -3363,13 +3505,28 @@ def main(argv: list[str] | None = None) -> int:
                 len(instances_by_pass[entry["id"]]) + generated_count_by_pass_id.get(entry["id"], 0),
             )
 
+        local_count_by_pass_id = {
+            entry["id"]: len(instances_by_pass[entry["id"]]) + generated_count_by_pass_id.get(entry["id"], 0)
+            for entry, _ in loaded_passes
+        }
+        cumulative_count_by_pass_id = {
+            pass_id: prefix_count_by_pass_id.get(pass_id, 0) + local_count_by_pass_id.get(pass_id, 0)
+            for pass_id in pass_ids
+        }
+        write_process_state(build_root, rel_from_shared_root, {
+            "file": rel_from_shared_root.as_posix(),
+            "input_fingerprint": current_input_fingerprint,
+            "prefix_state_fingerprint": prefix_state_fingerprint,
+            "state_fingerprint": build_next_prefix_state_fingerprint(prefix_state_fingerprint, local_count_by_pass_id),
+            "local_counts": local_count_by_pass_id,
+            "cumulative_counts": cumulative_count_by_pass_id,
+        })
+
         matched_pass_count = sum(1 for instances in instances_by_pass.values() if instances)
         total_instances = sum(len(instances) for instances in instances_by_pass.values())
-        print(f"[codegen] Matched {total_instances} instances across {matched_pass_count} passes")
         return 0
     if args.command == "assemble-pass":
         entry = load_pass_entry(args.build_root.resolve(), args.pass_id)
-        print(f"[codegen] Assemble pass: {args.pass_id}")
         source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
         write_pass_aggregate_headers(
             [entry],
@@ -3385,14 +3542,11 @@ def main(argv: list[str] | None = None) -> int:
     stamp_path = args.stamp or (output_root / "content.stamp")
     source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
 
-    print(f"[codegen] Scan: {shared_dir}")
     blocks, strip_map = discover_blocks(shared_dir, source_suffixes)
-    print(f"[codegen] Found {len(blocks)} marker blocks in {len(strip_map)} files")
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
     if not pass_blocks:
         raise ValueError(f"No $pass block found under {shared_dir}")
 
-    print(f"[codegen] Compile: {len(pass_blocks)} pass blocks")
     pass_defs: dict[str, PassDef] = {}
     for block in pass_blocks:
         preprocessed_pass_text = preprocess_pass_text(block.text, define_map, block.file)
@@ -3403,7 +3557,6 @@ def main(argv: list[str] | None = None) -> int:
 
     local_helper_count = sum(len(pass_def.local_helper_defs) for pass_def in pass_defs.values())
     instances_by_pass = {name: [] for name in pass_defs}
-    print(f"[codegen] Match: {len(pass_defs)} passes, {local_helper_count} local passes")
 
     global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes)
     for pass_name, values in global_instances_by_pass.items():
@@ -3422,7 +3575,6 @@ def main(argv: list[str] | None = None) -> int:
 
     output_root.mkdir(parents=True, exist_ok=True)
     total_instances = sum(len(instances) for instances in instances_by_pass.values())
-    print(f"[codegen] Emit: {total_instances} instances into {len(pass_defs)} output groups")
     for name, pass_def in pass_defs.items():
         fragments = render_fragments(
             pass_def,
@@ -3446,13 +3598,11 @@ def main(argv: list[str] | None = None) -> int:
             if write_text_if_changed(out_path, content):
                 print(f"Written: {out_path}")
 
-    print(f"[codegen] Rewrite: stripped shared sources -> {shared_output_root}")
     write_generated_sources(shared_dir, strip_map, shared_output_root, source_suffixes)
     stamp_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_path.write_text("# Generated by codegen\n")
     print(f"Written: {stamp_path}")
     if not args.no_syntax_hints:
-        print("[codegen] Emit: syntax hints")
         syntax_hints_path = args.syntax_hints or (output_root / "syntax_hints.h")
         write_syntax_hints(syntax_hints_path, [pass_def.name for pass_def in pass_defs.values() if pass_def.name])
     return 0
