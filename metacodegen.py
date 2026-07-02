@@ -411,7 +411,7 @@ def parse_legacy_schema_parts(
         if ch == "|" and in_branch:
             break
         if ch == "[":
-            branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file)
+            branch, i = parse_legacy_schema_branch(source, i + 1, pass_name, file, init_vars)
             parts.append(branch)
             continue
         if ch.isspace():
@@ -1282,7 +1282,7 @@ def match_schema(source: str, schema: list[SchemaPart], file: Path, pass_name: s
     trailing = source[pos:].strip()
     if trailing:
         raise ValueError(f"Syntax error in ${pass_name} block in {file}: unexpected trailing syntax {trailing!r}")
-    return values
+    return apply_missing_schema_captures(values, schema)
 
 
 def collect_schema_capture_names(schema: list[SchemaPart]) -> set[str]:
@@ -1296,6 +1296,13 @@ def collect_schema_capture_names(schema: list[SchemaPart]) -> set[str]:
             for alternative in part.alternatives or []:
                 names.update(collect_schema_capture_names(alternative))
     return names
+
+
+def apply_missing_schema_captures(values: dict[str, str], schema: list[SchemaPart]) -> dict[str, str]:
+    completed = values.copy()
+    for capture_name in collect_schema_capture_names(schema):
+        completed.setdefault(capture_name, "")
+    return completed
 
 
 def collect_schema_branch_labels(schema: list[SchemaPart]) -> set[str]:
@@ -1319,53 +1326,72 @@ def match_schema_nodes(
     values: dict[str, str],
     allow_trailing: bool = False,
 ) -> tuple[int, dict[str, str]] | None:
+    if allow_trailing:
+        best_match: tuple[int, dict[str, str]] | None = None
+        for matched in iter_schema_matches(source, schema, index, pos, values, allow_trailing):
+            if best_match is None or matched[0] > best_match[0]:
+                best_match = matched
+        return best_match
+    for matched in iter_schema_matches(source, schema, index, pos, values, allow_trailing):
+        return matched
+    return None
+
+
+def iter_schema_matches(
+    source: str,
+    schema: list[SchemaPart],
+    index: int,
+    pos: int,
+    values: dict[str, str],
+    allow_trailing: bool = False,
+):
     if index >= len(schema):
         if not allow_trailing and source[pos:].strip():
-            return None
-        return pos, values
+            return
+        yield pos, values
+        return
 
     part = schema[index]
     if part.kind == "literal":
         end = match_schema_literal(source, pos, part.value)
         if end is None:
-            return None
-        return match_schema_nodes(source, schema, index + 1, end, values, allow_trailing)
+            return
+        yield from iter_schema_matches(source, schema, index + 1, end, values, allow_trailing)
+        return
 
     if part.kind == "branch":
         for alt_index, alternative in enumerate(part.alternatives or []):
-            matched_alternative = match_schema_nodes(source, alternative, 0, pos, values.copy(), allow_trailing=True)
-            if matched_alternative is None:
-                continue
-            alternative_end, alternative_values = matched_alternative
-            if part.capture_name:
-                if not part.alternative_labels or part.alternative_labels[alt_index] is None:
-                    return None
-                alternative_values[part.capture_name] = part.alternative_labels[alt_index]
-            matched = match_schema_nodes(source, schema, index + 1, alternative_end, alternative_values, allow_trailing)
-            if matched is not None:
-                return matched
-        return None
+            for alternative_end, alternative_values in iter_schema_matches(
+                source,
+                alternative,
+                0,
+                pos,
+                values.copy(),
+                allow_trailing=True,
+            ):
+                next_values = alternative_values
+                if part.capture_name:
+                    if not part.alternative_labels or part.alternative_labels[alt_index] is None:
+                        continue
+                    next_values = alternative_values.copy()
+                    next_values[part.capture_name] = part.alternative_labels[alt_index]
+                yield from iter_schema_matches(source, schema, index + 1, alternative_end, next_values, allow_trailing)
+        return
 
     if part.kind == "eof":
         end = skip_c_whitespace(source, pos)
         if end != len(source):
-            return None
-        return match_schema_nodes(source, schema, index + 1, end, values, allow_trailing)
+            return
+        yield from iter_schema_matches(source, schema, index + 1, end, values, allow_trailing)
+        return
 
-    if index == len(schema) - 1 and allow_trailing:
-        capture_positions = list(reversed(list(iter_capture_end_positions(source, pos))))
-    else:
-        capture_positions = iter_capture_end_positions(source, pos)
+    capture_positions = iter_capture_end_positions(source, pos)
 
     for capture_end in capture_positions:
         captured = source[pos:capture_end].strip()
         next_values = values.copy()
         next_values[part.value] = captured
-        matched = match_schema_nodes(source, schema, index + 1, capture_end, next_values, allow_trailing)
-        if matched is not None:
-            return matched
-
-    return None
+        yield from iter_schema_matches(source, schema, index + 1, capture_end, next_values, allow_trailing)
 
 
 def match_schema_literal(source: str, start: int, literal: str) -> int | None:
@@ -1821,7 +1847,24 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
         counters[name] = value + 1
         return value
 
+    def identifier_suffix(value) -> str:
+        text = str(value)
+        text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+        text = re.sub(r"_+", "_", text).strip("_")
+        return text or "0"
+
     translated = re.sub(r"\b([A-Za-z_]\w*)\+\+", lambda m: f'__post_inc__("{m.group(1)}")', expr)
+    safe_builtins = {
+        "abs": abs,
+        "bool": bool,
+        "float": float,
+        "int": int,
+        "len": len,
+        "max": max,
+        "min": min,
+        "range": range,
+        "str": str,
+    }
     scope = {}
     scope.update(counters)
     scope.update(fields)
@@ -1829,6 +1872,8 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
         if isinstance(field_value, str) and re.fullmatch(r"[A-Za-z_]\w*", field_value):
             scope.setdefault(field_value, field_value)
     scope.update(helper_functions)
+    scope.update(safe_builtins)
+    scope["identifier_suffix"] = identifier_suffix
     scope["__post_inc__"] = post_inc
     try:
         value = eval(translated, {"__builtins__": {}}, scope)
@@ -2496,6 +2541,7 @@ def execute_named_pass(
                 raise ValueError(f"Local pass {pass_def.name} could not match near {snippet!r}")
 
             end, fields = matched
+            fields = apply_missing_schema_captures(fields, pass_def.schema)
             if end <= 0:
                 if skip_c_whitespace(item_text, 0) == len(item_text):
                     continue
@@ -2694,6 +2740,13 @@ def write_text_if_changed(out_path: Path, content: str) -> bool:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content)
     return True
+
+
+def write_stamp_if_changed(stamp_path: Path | None, token: str) -> bool:
+    if stamp_path is None:
+        return False
+    content = token.rstrip() + "\n"
+    return write_text_if_changed(stamp_path, content)
 
 
 def delete_file_if_exists(path: Path) -> bool:
@@ -2932,6 +2985,11 @@ def build_next_prefix_state_fingerprint(prefix_state_fingerprint: str, local_cou
     return hash_text(stable_json_dumps(payload))
 
 
+def build_count_fingerprint(count_map: dict[str, int]) -> str:
+    normalized = {name: int(count_map.get(name, 0)) for name in sorted(count_map)}
+    return hash_text(stable_json_dumps(normalized))
+
+
 def process_file_expected_outputs(
     loaded_passes: list[tuple[dict, PassDef]],
     rel_file: Path,
@@ -3150,6 +3208,7 @@ def parse_compile_passes_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--build-root", required=True, type=Path, help="Directory where generated pass descriptors are written")
     parser.add_argument("--shared-dir", type=Path, default=None, help="Optional shared source root used to emit aggregate headers")
     parser.add_argument("--output-root", type=Path, default=None, help="Output root for aggregate generated headers when --shared-dir is set")
+    parser.add_argument("--stamp", type=Path, default=None, help="Optional stamp file updated only when compiled pass outputs change")
     parser.add_argument(
         "--generated-header-prefix",
         default="",
@@ -3195,6 +3254,7 @@ def parse_process_file_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--input", required=True, type=Path, help="Source file to process")
     parser.add_argument("--shared-root", required=True, type=Path, help="Root directory of shared source files")
     parser.add_argument("--shared-output-root", required=True, type=Path, help="Output root for stripped shared files")
+    parser.add_argument("--stamp", type=Path, default=None, help="Optional stamp file updated only when this file changes downstream-visible output")
     parser.add_argument(
         "--define",
         dest="defines",
@@ -3213,6 +3273,7 @@ def parse_assemble_pass_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--pass-id", required=True, help="Pass id to assemble")
     parser.add_argument("--shared-root", required=True, type=Path, help="Root directory of shared source files")
     parser.add_argument("--output-root", required=True, type=Path, help="Root directory for assembled generated headers")
+    parser.add_argument("--stamp", type=Path, default=None, help="Optional stamp file updated only when assembled outputs change")
     parser.add_argument(
         "--source-suffix",
         dest="source_suffixes",
@@ -3361,6 +3422,8 @@ def main(argv: list[str] | None = None) -> int:
             write_pass_descriptor(descriptor_path, entry)
         if args.shared_dir is not None and args.output_root is not None:
             write_public_output_headers(entries, args.output_root.resolve())
+        if args.stamp is not None:
+            write_stamp_if_changed(args.stamp.resolve(), hash_text(stable_json_dumps(entries)))
         return 0
     if args.command == "process-file":
         shared_root = args.shared_root.resolve()
@@ -3397,17 +3460,17 @@ def main(argv: list[str] | None = None) -> int:
         source_file_index = rel_source_files.index(rel_from_shared_root)
         prev_rel_file = rel_source_files[source_file_index - 1] if source_file_index > 0 else None
         prefix_count_by_pass_id = zero_count_map(pass_ids)
-        prefix_state_fingerprint = "root"
+        prefix_state_fingerprint = build_count_fingerprint(prefix_count_by_pass_id)
         if prev_rel_file is not None:
             prev_state = load_process_state(build_root, prev_rel_file)
             if prev_state is not None:
-                prefix_state_fingerprint = prev_state.get("state_fingerprint", "root")
                 for pass_id in pass_ids:
                     prefix_count_by_pass_id[pass_id] = int(prev_state.get("cumulative_counts", {}).get(pass_id, 0))
+                prefix_state_fingerprint = build_count_fingerprint(prefix_count_by_pass_id)
             else:
                 for entry, _ in loaded_passes:
                     prefix_count_by_pass_id[entry["id"]] = compute_index_base(entry, build_root, rel_from_shared_root, rel_source_files)
-                prefix_state_fingerprint = hash_text(stable_json_dumps(prefix_count_by_pass_id))
+                prefix_state_fingerprint = build_count_fingerprint(prefix_count_by_pass_id)
 
         loaded_pass_fingerprint = build_loaded_pass_descriptor_fingerprint(loaded_passes)
         current_input_fingerprint = build_process_state_fingerprint(
@@ -3434,6 +3497,8 @@ def main(argv: list[str] | None = None) -> int:
                 build_root,
             ))
         ):
+            if args.stamp is not None:
+                write_stamp_if_changed(args.stamp.resolve(), current_state.get("state_fingerprint", current_input_fingerprint))
             return 0
 
         external_pass_generated_counts: dict[str, int] = {}
@@ -3513,14 +3578,17 @@ def main(argv: list[str] | None = None) -> int:
             pass_id: prefix_count_by_pass_id.get(pass_id, 0) + local_count_by_pass_id.get(pass_id, 0)
             for pass_id in pass_ids
         }
+        state_fingerprint = build_count_fingerprint(cumulative_count_by_pass_id)
         write_process_state(build_root, rel_from_shared_root, {
             "file": rel_from_shared_root.as_posix(),
             "input_fingerprint": current_input_fingerprint,
             "prefix_state_fingerprint": prefix_state_fingerprint,
-            "state_fingerprint": build_next_prefix_state_fingerprint(prefix_state_fingerprint, local_count_by_pass_id),
+            "state_fingerprint": state_fingerprint,
             "local_counts": local_count_by_pass_id,
             "cumulative_counts": cumulative_count_by_pass_id,
         })
+        if args.stamp is not None:
+            write_stamp_if_changed(args.stamp.resolve(), state_fingerprint)
 
         matched_pass_count = sum(1 for instances in instances_by_pass.values() if instances)
         total_instances = sum(len(instances) for instances in instances_by_pass.values())
@@ -3528,12 +3596,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "assemble-pass":
         entry = load_pass_entry(args.build_root.resolve(), args.pass_id)
         source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
-        write_pass_aggregate_headers(
+        written_paths = write_pass_aggregate_headers(
             [entry],
             args.shared_root.resolve(),
             args.output_root.resolve(),
             source_suffixes,
         )
+        if args.stamp is not None:
+            stamp_payload = []
+            for path in written_paths:
+                stamp_payload.append({
+                    "path": path.as_posix(),
+                    "content_sha1": hash_text(path.read_text()) if path.exists() else "",
+                })
+            write_stamp_if_changed(args.stamp.resolve(), hash_text(stable_json_dumps(stamp_payload)))
         return 0
 
     shared_dir = args.shared_dir
