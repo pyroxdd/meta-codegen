@@ -1202,6 +1202,84 @@ def block_end(text: str, start: int) -> int:
     raise ValueError("Unclosed $ block")
 
 
+def parse_builtin_wrap_block(block: MarkerBlock) -> list[MarkerBlock] | None:
+    text = block.text.strip()
+    if not text.startswith("wrap"):
+        return None
+
+    i = len("wrap")
+    if i >= len(text) or not text[i].isspace():
+        return None
+    i = skip_c_whitespace(text, i)
+    if i >= len(text) or text[i] not in "\"'":
+        raise ValueError(f'Invalid $wrap block in {block.file}: expected quoted prefix after "wrap"')
+
+    prefix, i = parse_schema_string_literal(text, i)
+    i = skip_c_whitespace(text, i)
+    if i >= len(text) or text[i] != "{":
+        raise ValueError(f"Invalid $wrap block in {block.file}: expected '{{' after wrap prefix")
+
+    body_end = matching_brace(text, i)
+    if body_end is None:
+        raise ValueError(f"Invalid $wrap block in {block.file}: unterminated wrapper body")
+
+    trailing = text[body_end + 1:].strip()
+    if trailing:
+        raise ValueError(f"Invalid $wrap block in {block.file}: unexpected trailing syntax {trailing!r}")
+
+    body = text[i + 1:body_end]
+    synthetic_blocks: list[MarkerBlock] = []
+    body_index = 0
+
+    while True:
+        body_index = skip_c_whitespace(body, body_index)
+        if body_index >= len(body):
+            break
+
+        name_match = re.match(r"[A-Za-z_]\w*", body[body_index:])
+        if name_match is None:
+            snippet = body[body_index:body_index + 40]
+            raise ValueError(f"Invalid $wrap entry in {block.file}: expected entry name near {snippet!r}")
+
+        local_name = name_match.group(0)
+        body_index += len(local_name)
+        body_index = skip_c_whitespace(body, body_index)
+        if body_index >= len(body) or body[body_index] != "{":
+            raise ValueError(f"Invalid $wrap entry {local_name!r} in {block.file}: expected '{{' after entry name")
+
+        entry_end = matching_brace(body, body_index)
+        if entry_end is None:
+            raise ValueError(f"Invalid $wrap entry {local_name!r} in {block.file}: unterminated entry body")
+
+        entry_body = body[body_index + 1:entry_end].strip()
+        synthetic_text = f"{prefix}{local_name} {{\n{entry_body}\n}}"
+        synthetic_blocks.append(MarkerBlock(
+            file=block.file,
+            start=block.start,
+            end=block.end,
+            text=synthetic_text,
+        ))
+
+        body_index = entry_end + 1
+        while body_index < len(body) and body[body_index].isspace():
+            body_index += 1
+        if body_index < len(body) and body[body_index] == ";":
+            body_index += 1
+
+    return synthetic_blocks
+
+
+def expand_builtin_blocks(blocks: list[MarkerBlock]) -> list[MarkerBlock]:
+    expanded: list[MarkerBlock] = []
+    for block in blocks:
+        synthetic_blocks = parse_builtin_wrap_block(block)
+        if synthetic_blocks is None:
+            expanded.append(block)
+        else:
+            expanded.extend(synthetic_blocks)
+    return expanded
+
+
 def iter_source_files(shared_dir: Path, source_suffixes: tuple[str, ...]) -> list[Path]:
     suffixes = {suffix.lower() for suffix in source_suffixes}
     return [
@@ -1215,7 +1293,7 @@ def discover_blocks(
     shared_dir: Path,
     source_suffixes: tuple[str, ...],
 ) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
-    blocks = []
+    raw_blocks = []
     strip_blocks: dict[Path, list[MarkerBlock]] = {}
 
     for file in iter_source_files(shared_dir, source_suffixes):
@@ -1225,10 +1303,10 @@ def discover_blocks(
             end = block_end(source, start)
             text = source[start + MARKER_LEN:end]
             block = MarkerBlock(file=file, start=start, end=end, text=text)
-            blocks.append(block)
+            raw_blocks.append(block)
             strip_blocks.setdefault(file, []).append(block)
 
-    return blocks, strip_blocks
+    return expand_builtin_blocks(raw_blocks), strip_blocks
 
 
 def collect_instances_by_pass(
@@ -2858,13 +2936,13 @@ def remove_stale_pass_artifacts(build_root: Path, active_ids: set[str]) -> None:
 
 def discover_blocks_in_file(file: Path) -> tuple[list[MarkerBlock], list[MarkerBlock], str]:
     source = file.read_text()
-    blocks: list[MarkerBlock] = []
+    raw_blocks: list[MarkerBlock] = []
     positions = marker_positions(source)
     for start in positions:
         end = block_end(source, start)
         text = source[start + MARKER_LEN:end]
-        blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
-    return blocks, blocks.copy(), source
+        raw_blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
+    return expand_builtin_blocks(raw_blocks), raw_blocks.copy(), source
 
 
 def iter_pass_descriptor_paths(build_root: Path) -> list[Path]:
