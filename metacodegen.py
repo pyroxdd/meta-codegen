@@ -40,6 +40,7 @@ class PassDef:
     name: str | None
     callable_name: str | None
     block_keyword: str
+    arg_defs: list["PassArgDef"]
     schema: list["SchemaPart"]
     init_vars: dict
     output_params: list[str]
@@ -58,6 +59,13 @@ class FuncDef:
 
 
 @dataclass
+class PassArgDef:
+    type_name: str
+    name: str
+    default_expr: str = ""
+
+
+@dataclass
 class InstanceOp:
     kind: str
     target: str | None = None
@@ -65,6 +73,7 @@ class InstanceOp:
     helper_name: str | None = None
     input_expr: str | None = None
     output_targets: list[str] | None = None
+    arg_overrides: dict[str, str] | None = None
     alias_name: str | None = None
     source_target: str | None = None
     condition_field: str | None = None
@@ -721,12 +730,11 @@ def parse_instance_statement(text: str, block_lines: list[str] | None = None) ->
     if call_match:
         helper_name = call_match.group(1)
         input_expr = call_match.group(2).strip()
-        output_targets = [part.strip() for part in split_top_level(call_match.group(3), ",") if part.strip()]
         return InstanceOp(
             kind="call",
             helper_name=helper_name,
             input_expr=input_expr,
-            output_targets=output_targets,
+            arg_overrides=parse_named_overrides(call_match.group(3), Path("<instance>"), f"call {helper_name}"),
         )
 
     invoke_match = re.match(r'\s*([A-Za-z_]\w*)\s*\[(.+)\]\s*$', text)
@@ -735,6 +743,7 @@ def parse_instance_statement(text: str, block_lines: list[str] | None = None) ->
             kind="invoke",
             helper_name=invoke_match.group(1),
             input_expr=invoke_match.group(2).strip(),
+            arg_overrides={},
         )
 
     raise ValueError(f"Unsupported instance statement: {text.strip()!r}")
@@ -868,6 +877,176 @@ def declared_instance_aliases(ops: list[InstanceOp]) -> set[str]:
         for op in iter_instance_ops(ops)
         if op.kind in {"var", "assign"} and op.alias_name is not None
     }
+
+
+def matching_delimiter(source: str, open_index: int, open_char: str, close_char: str) -> int | None:
+    depth = 0
+    in_string = False
+    string_quote = ""
+    escaped = False
+    in_line_comment = False
+    in_block_comment = False
+
+    for i in range(open_index, len(source)):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == string_quote:
+                in_string = False
+                string_quote = ""
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            continue
+
+        if ch in ("'", '"'):
+            in_string = True
+            string_quote = ch
+            escaped = False
+            continue
+
+        if ch == open_char:
+            depth += 1
+        elif ch == close_char:
+            depth -= 1
+            if depth == 0:
+                return i
+
+    return None
+
+
+def parse_arg_defs(arg_text: str, file: Path, context: str) -> list[PassArgDef]:
+    arg_text = arg_text.strip()
+    if not arg_text:
+        return []
+
+    arg_defs: list[PassArgDef] = []
+    for raw_part in split_top_level_extended(arg_text, ","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        match = re.fullmatch(r"(string|file|bool|int|outstring)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?", part, re.DOTALL)
+        if match is None:
+            raise ValueError(f"Invalid pass argument {part!r} in {context} in {file}")
+        type_name = match.group(1)
+        default_expr = (match.group(3) or "").strip()
+        if not default_expr and type_name not in {"file", "outstring"}:
+            raise ValueError(f"Pass argument {match.group(2)!r} of type {type_name} requires a default value in {context} in {file}")
+        if default_expr and type_name == "outstring":
+            raise ValueError(f"Pass argument {match.group(2)!r} of type outstring may not declare a default value in {context} in {file}")
+        arg_defs.append(PassArgDef(
+            type_name=type_name,
+            name=match.group(2),
+            default_expr=default_expr,
+        ))
+    return arg_defs
+
+
+def seed_init_vars_from_arg_defaults(arg_defs: list[PassArgDef], init_vars: dict[str, object]) -> None:
+    for arg_def in arg_defs:
+        if arg_def.type_name in {"file", "outstring"}:
+            continue
+        if not arg_def.default_expr:
+            continue
+        if arg_def.type_name == "string":
+            literal_value = parse_wrapped_schema_literal(arg_def.default_expr)
+            if literal_value is not None:
+                init_vars.setdefault(arg_def.name, literal_value)
+            continue
+        if arg_def.type_name == "int" and re.fullmatch(r"-?\d+", arg_def.default_expr):
+            init_vars.setdefault(arg_def.name, arg_def.default_expr)
+            continue
+        if arg_def.type_name == "bool" and arg_def.default_expr in {"true", "false"}:
+            init_vars.setdefault(arg_def.name, arg_def.default_expr)
+            continue
+
+
+def parse_named_overrides(arg_text: str, file: Path, context: str) -> dict[str, str]:
+    arg_text = arg_text.strip()
+    if not arg_text:
+        return {}
+
+    overrides: dict[str, str] = {}
+    for raw_part in split_top_level_extended(arg_text, ","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"Invalid named argument override {part!r} in {context} in {file}")
+        name, expr = part.split("=", 1)
+        name = name.strip()
+        expr = expr.strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+            raise ValueError(f"Invalid argument name {name!r} in {context} in {file}")
+        overrides[name] = expr
+    return overrides
+
+
+def parse_new_pass_declaration(pass_text: str, file: Path) -> tuple[str, str, list[PassArgDef], str]:
+    source = pass_text.strip()
+    if not source.startswith("pass"):
+        raise ValueError(f"Expected pass declaration in {file}")
+
+    i = len("pass")
+    if i >= len(source) or not source[i].isspace():
+        raise ValueError(f"Expected pass name in {file}")
+    i = skip_c_whitespace(source, i)
+
+    name_match = re.match(r"[A-Za-z_]\w*", source[i:])
+    if name_match is None:
+        raise ValueError(f"Expected pass name in {file}")
+    pass_name = name_match.group(0)
+    i += len(pass_name)
+    i = skip_c_whitespace(source, i)
+
+    if i >= len(source) or source[i] != "[":
+        raise ValueError(f"Pass {pass_name} in {file} must declare schema in [...]")
+    schema_end = matching_delimiter(source, i, "[", "]")
+    if schema_end is None:
+        raise ValueError(f"Unterminated schema block for pass {pass_name} in {file}")
+    schema_text = source[i + 1:schema_end].strip()
+    i = skip_c_whitespace(source, schema_end + 1)
+
+    arg_defs: list[PassArgDef] = []
+    if i < len(source) and source[i] == "(":
+        args_end = matching_delimiter(source, i, "(", ")")
+        if args_end is None:
+            raise ValueError(f"Unterminated argument list for pass {pass_name} in {file}")
+        arg_defs = parse_arg_defs(source[i + 1:args_end], file, f"pass {pass_name}")
+        i = skip_c_whitespace(source, args_end + 1)
+
+    if i >= len(source) or source[i] != "{":
+        raise ValueError(f"Pass {pass_name} in {file} must declare a body in {{...}}")
+    body_end = matching_brace(source, i)
+    if body_end is None:
+        raise ValueError(f"Unterminated body for pass {pass_name} in {file}")
+    body_text = source[i + 1:body_end].strip()
+    trailing = source[body_end + 1:].strip()
+    if trailing not in ("", ";"):
+        raise ValueError(f"Unexpected trailing syntax after pass {pass_name} in {file}: {trailing!r}")
+    return pass_name, schema_text, arg_defs, body_text
 
 
 def parse_named_block_header(header: str, file: Path, keyword: str) -> tuple[str | None, list[str]]:
@@ -1016,6 +1195,7 @@ def compile_local_pass(local_pass_text: str, file: Path, inherited_init_vars: di
         name=name,
         callable_name=None,
         block_keyword=name,
+        arg_defs=[],
         schema=schema,
         init_vars=init_vars,
         output_params=output_params,
@@ -1052,81 +1232,30 @@ def compile_func(func_text: str, file: Path) -> FuncDef:
     )
 
 
-def compile_pass(pass_text: str, file: Path) -> PassDef:
-    stripped_pass = pass_text.strip()
+def compile_nested_pass(pass_text: str, file: Path) -> PassDef:
+    pass_name, schema_text, arg_defs, body_text = parse_new_pass_declaration(pass_text, file)
     local_helper_defs: dict[str, PassDef] = {}
     local_func_defs: dict[str, FuncDef] = {}
-    legacy_sections = parse_legacy_two_block_sections(stripped_pass, "pass")
-    if legacy_sections is not None:
-        raise ValueError(
-            f"Legacy two-block $pass syntax is no longer supported in {file}; "
-            f"use `$pass {{ ... schema {{ ... }} instance {{ ... }} }}` instead"
-        )
 
-    pass_text = unwrap_pass_block(pass_text)
-    lines = pass_text.lstrip().splitlines()
-    first_line = lines[0].strip()
-    top_level_name, output_params, has_outputs = parse_pass_header(first_line, file)
-    if has_outputs:
-        raise ValueError(f"Top-level pass in {file} cannot declare outputs; use nested local pass <name>(...) for helpers")
-    body_text = "\n".join(lines[1:])
     body_text, func_texts = extract_top_level_named_blocks(body_text, "func")
     for func_text in func_texts:
         func_def = compile_func(func_text, file)
         if func_def.name in local_func_defs:
-            raise ValueError(f"Duplicate func {func_def.name} in {file}")
+            raise ValueError(f"Duplicate func {func_def.name} in nested pass {pass_name} in {file}")
         local_func_defs[func_def.name] = func_def
-    body_text, local_pass_texts = extract_top_level_named_blocks(body_text, "local pass")
-    rebuilt_pass_text = first_line
-    if body_text:
-        rebuilt_pass_text += "\n" + body_text
-    sections = parse_pass_file(rebuilt_pass_text)
-    missing = [section_name for section_name in ("schema", "instance") if section_name not in sections]
-    if missing:
-        raise ValueError(f"Top-level $pass in {file} is missing section(s): {', '.join(missing)}")
-    raw_python = sections.get("python", "")
-    init_vars = run_init_python(raw_python, file)
 
-    for local_pass_text in local_pass_texts:
-        local_pass_def = compile_local_pass(local_pass_text, file, init_vars)
-        if local_pass_def.name in local_helper_defs:
-            raise ValueError(f"Duplicate local pass {local_pass_def.name} in {file}")
-        local_helper_defs[local_pass_def.name] = local_pass_def
+    body_text, nested_pass_texts = extract_top_level_named_blocks(body_text, "pass")
+    for nested_pass_text in nested_pass_texts:
+        nested_pass_def = compile_nested_pass(nested_pass_text, file)
+        if nested_pass_def.name in local_helper_defs:
+            raise ValueError(f"Duplicate nested pass {nested_pass_def.name} in nested pass {pass_name} in {file}")
+        local_helper_defs[nested_pass_def.name] = nested_pass_def
 
-    instance_ops = parse_instance_section(sections["instance"])
+    init_vars: dict[str, object] = {}
+    seed_init_vars_from_arg_defaults(arg_defs, init_vars)
+    instance_ops = parse_instance_section(body_text)
     declared_aliases = declared_instance_aliases(instance_ops)
-    invalid_emit_targets = sorted({
-        op.target for op in iter_instance_ops(instance_ops)
-        if op.kind == "emit" and op.target is not None and not target_is_allowed(op.target, declared_aliases)
-    })
-    if invalid_emit_targets:
-        raise ValueError(
-            f"Top-level $pass in {file} must write to outputs using 'out.<name> += ...' or a declared variable, found: {', '.join(invalid_emit_targets)}"
-        )
-    invalid_assignments = []
-    for op in iter_instance_ops(instance_ops):
-        if op.kind != "assign":
-            continue
-        if op.source_target is None:
-            continue
-        if not target_is_allowed(op.source_target, declared_aliases):
-            invalid_assignments.append(op.source_target)
-    if invalid_assignments:
-        raise ValueError(
-            f"Top-level $pass in {file} may only bind variables to 'out.<name>' sinks or other declared variables, found: {', '.join(invalid_assignments)}"
-        )
-    invalid_call_targets = sorted({
-        target
-        for op in iter_instance_ops(instance_ops)
-        if op.kind == "call" and op.output_targets is not None
-        for target in op.output_targets
-        if not target_is_allowed(target, declared_aliases)
-    })
-    if invalid_call_targets:
-        raise ValueError(
-            f"Top-level $pass in {file} must pass outputs as 'out.<name>' or declared variables when calling local passes, found: {', '.join(invalid_call_targets)}"
-        )
-    schema = parse_schema_template(sections["schema"], None, file, init_vars)
+    schema = parse_schema_template(schema_text, pass_name, file, init_vars)
     enum_labels = collect_schema_branch_labels(schema)
     for helper_def in local_helper_defs.values():
         enum_labels.update(collect_schema_branch_labels(helper_def.schema))
@@ -1136,18 +1265,114 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
         for helper_def in local_helper_defs.values():
             helper_def.init_vars.setdefault(label, label)
 
+    file_arg_names = {arg.name for arg in arg_defs if arg.type_name == "file"}
+    outstring_arg_names = {arg.name for arg in arg_defs if arg.type_name == "outstring"}
+    invalid_emit_targets = sorted({
+        op.target for op in iter_instance_ops(instance_ops)
+        if op.kind == "emit" and op.target is not None and op.target not in declared_aliases and op.target not in file_arg_names and op.target not in outstring_arg_names
+    })
+    if invalid_emit_targets:
+        raise ValueError(
+            f"Nested pass {pass_name} in {file} may only write to declared variables, file arguments, or outstring arguments, found: {', '.join(invalid_emit_targets)}"
+        )
+
+    output_targets = []
+    for arg_def in arg_defs:
+        if arg_def.type_name != "file":
+            continue
+        if not arg_def.default_expr:
+            output_targets.append(f"file:{pass_name}_{arg_def.name}")
+            continue
+        literal_value = parse_wrapped_schema_literal(arg_def.default_expr)
+        if literal_value is None:
+            raise ValueError(
+                f"File argument {arg_def.name} in nested pass {pass_name} must currently use a quoted literal default in {file}"
+            )
+        output_targets.append(f"file:{literal_value}")
+
     return PassDef(
-        name=None,
-        callable_name=top_level_name,
-        block_keyword="__top_level__",
+        name=pass_name,
+        callable_name=None,
+        block_keyword=pass_name,
+        arg_defs=arg_defs,
         schema=schema,
         init_vars=init_vars,
-        output_params=output_params,
-        instance_targets=list(dict.fromkeys(
-            output_target_key(op.target)
-            for op in iter_instance_ops(instance_ops)
-            if op.kind == "emit" and op.target is not None and op.target not in declared_aliases and parse_output_target(op.target) is not None
-        )),
+        output_params=[],
+        instance_targets=list(dict.fromkeys(output_targets)),
+        instance_ops=instance_ops,
+        is_helper=True,
+        local_helper_defs=local_helper_defs,
+        local_func_defs=local_func_defs,
+    )
+
+
+def compile_pass(pass_text: str, file: Path) -> PassDef:
+    pass_name, schema_text, arg_defs, body_text = parse_new_pass_declaration(pass_text, file)
+    local_helper_defs: dict[str, PassDef] = {}
+    local_func_defs: dict[str, FuncDef] = {}
+
+    body_text, func_texts = extract_top_level_named_blocks(body_text, "func")
+    for func_text in func_texts:
+        func_def = compile_func(func_text, file)
+        if func_def.name in local_func_defs:
+            raise ValueError(f"Duplicate func {func_def.name} in {file}")
+        local_func_defs[func_def.name] = func_def
+
+    body_text, nested_pass_texts = extract_top_level_named_blocks(body_text, "pass")
+    for nested_pass_text in nested_pass_texts:
+        nested_pass_def = compile_nested_pass(nested_pass_text, file)
+        if nested_pass_def.name in local_helper_defs:
+            raise ValueError(f"Duplicate nested pass {nested_pass_def.name} in {file}")
+        local_helper_defs[nested_pass_def.name] = nested_pass_def
+
+    init_vars: dict[str, object] = {}
+    seed_init_vars_from_arg_defaults(arg_defs, init_vars)
+    instance_ops = parse_instance_section(body_text)
+    declared_aliases = declared_instance_aliases(instance_ops)
+    schema = parse_schema_template(schema_text, pass_name, file, init_vars)
+    enum_labels = collect_schema_branch_labels(schema)
+    for helper_def in local_helper_defs.values():
+        enum_labels.update(collect_schema_branch_labels(helper_def.schema))
+        helper_def.local_func_defs = local_func_defs
+    for label in enum_labels:
+        init_vars.setdefault(label, label)
+        for helper_def in local_helper_defs.values():
+            helper_def.init_vars.setdefault(label, label)
+
+    file_arg_names = {arg.name for arg in arg_defs if arg.type_name == "file"}
+    outstring_arg_names = {arg.name for arg in arg_defs if arg.type_name == "outstring"}
+    invalid_emit_targets = sorted({
+        op.target for op in iter_instance_ops(instance_ops)
+        if op.kind == "emit" and op.target is not None and op.target not in declared_aliases and op.target not in file_arg_names and op.target not in outstring_arg_names
+    })
+    if invalid_emit_targets:
+        raise ValueError(
+            f"Top-level $pass {pass_name} in {file} may only write to declared variables, file arguments, or outstring arguments, found: {', '.join(invalid_emit_targets)}"
+        )
+
+    output_targets = []
+    for arg_def in arg_defs:
+        if arg_def.type_name != "file":
+            continue
+        if not arg_def.default_expr:
+            output_targets.append(f"file:{pass_name}_{arg_def.name}")
+            continue
+        literal_value = parse_wrapped_schema_literal(arg_def.default_expr)
+        if literal_value is None:
+            raise ValueError(
+                f"File argument {arg_def.name} in pass {pass_name} must currently use a quoted literal default in {file}"
+            )
+        output_targets.append(f"file:{literal_value}")
+
+    return PassDef(
+        name=pass_name,
+        callable_name=pass_name,
+        block_keyword=pass_name,
+        arg_defs=arg_defs,
+        schema=schema,
+        init_vars=init_vars,
+        output_params=[],
+        instance_targets=list(dict.fromkeys(output_targets)),
         instance_ops=instance_ops,
         is_helper=False,
         local_helper_defs=local_helper_defs,
@@ -1735,11 +1960,15 @@ def collect_instances_by_pass(
             continue
         pass_id, values = identify_pass(block, pass_defs)
         instances_by_pass[pass_id].append(values)
+    for name, pass_def in pass_defs.items():
+        if pass_def.callable_name is None:
+            continue
+        instances_by_pass.setdefault(pass_def.callable_name, instances_by_pass[name])
     return instances_by_pass
 
 
 def parse_instance(block: MarkerBlock, pass_def: PassDef) -> dict[str, str]:
-    return match_schema(block.text.strip(), pass_def.schema, block.file, pass_def.name)
+    return match_schema(block.text.strip(), pass_def.schema, block.file, pass_def.name or pass_def.callable_name or "<pass>")
 
 
 def identify_pass(block: MarkerBlock, pass_defs: dict[str, PassDef]) -> tuple[str, dict[str, str]]:
@@ -2199,6 +2428,8 @@ def parse_output_target(target: str) -> tuple[str, str] | None:
         return ("header", target[4:])
     if target.startswith("source."):
         return ("source", target[7:])
+    if target.startswith("file:"):
+        return ("file", target[5:])
     return None
 
 
@@ -2235,6 +2466,11 @@ def rel_output_path_for_target(
         if generated_header_root:
             rel_output = Path(generated_header_root) / rel_output
         return rel_output
+    if kind == "file":
+        rel_output = Path(f"{generated_header_prefix}{name}.h")
+        if generated_header_root:
+            rel_output = Path(generated_header_root) / rel_output
+        return rel_output
     rel_output = Path(f"{generated_source_prefix}{name}.cpp")
     if generated_source_root:
         rel_output = Path(generated_source_root) / rel_output
@@ -2248,10 +2484,6 @@ def collect_declared_output_targets(instance_ops: list[InstanceOp]) -> list[str]
             targets.append(op.target)
         elif op.kind == "assign" and op.source_target is not None and parse_output_target(op.source_target) is not None:
             targets.append(op.source_target)
-        elif op.kind == "call" and op.output_targets is not None:
-            for target in op.output_targets:
-                if parse_output_target(target) is not None:
-                    targets.append(target)
     return list(dict.fromkeys(targets))
 
 
@@ -2272,6 +2504,81 @@ def resolve_output_sink(
     raise ValueError(
         f"Unknown output target {target!r}; use a declared named-pass output parameter or a global output like 'out.<name>' or 'source.<name>'"
     )
+
+
+def bind_file_arg_outputs(
+    pass_def: PassDef,
+    fields: dict[str, str],
+    inherited_bindings: dict[str, list[str]],
+    global_accs: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    bindings = dict(inherited_bindings)
+    for arg_def in pass_def.arg_defs:
+        if arg_def.type_name != "file":
+            continue
+        file_name = fields.get(arg_def.name, "").strip()
+        if not file_name:
+            continue
+        bindings[arg_def.name] = global_accs.setdefault(output_target_key(f"file:{file_name}"), [])
+    return bindings
+
+
+def bind_outstring_arg_outputs(
+    pass_def: PassDef,
+    override_exprs: dict[str, str] | None,
+    inherited_bindings: dict[str, list[str]],
+    global_accs: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    bindings = dict(inherited_bindings)
+    override_exprs = override_exprs or {}
+    for arg_def in pass_def.arg_defs:
+        if arg_def.type_name != "outstring":
+            continue
+        target_expr = override_exprs.get(arg_def.name, "").strip()
+        if not target_expr:
+            target_name = pass_def.name or pass_def.callable_name or "<unnamed>"
+            raise ValueError(f"Pass {target_name} requires outstring binding for argument {arg_def.name!r}")
+        bindings[arg_def.name] = resolve_output_sink(target_expr, inherited_bindings, global_accs)
+    return bindings
+
+
+def default_file_arg_stem(pass_def: PassDef, arg_def: PassArgDef) -> str:
+    pass_name = pass_def.callable_name or pass_def.name or "pass"
+    return f"{pass_name}_{arg_def.name}"
+
+
+def resolve_pass_arg_values(
+    pass_def: PassDef,
+    captured_fields: dict[str, str],
+    caller_fields: dict[str, str],
+    caller_counters: dict,
+    caller_helper_functions: dict[str, object],
+    override_exprs: dict[str, str] | None = None,
+) -> dict[str, str]:
+    resolved = captured_fields.copy()
+    override_exprs = override_exprs or {}
+    known_arg_names = {arg_def.name for arg_def in pass_def.arg_defs}
+    unknown_override_names = sorted(name for name in override_exprs if name not in known_arg_names)
+    if unknown_override_names:
+        target_name = pass_def.name or pass_def.callable_name or "<unnamed>"
+        raise ValueError(f"Unknown argument override(s) for pass {target_name}: {', '.join(unknown_override_names)}")
+
+    for arg_def in pass_def.arg_defs:
+        if arg_def.name in override_exprs:
+            if arg_def.type_name == "outstring":
+                resolved[arg_def.name] = ""
+                continue
+            resolved[arg_def.name] = render_template(override_exprs[arg_def.name], caller_fields, caller_counters, caller_helper_functions)
+            continue
+        if arg_def.type_name == "file" and not arg_def.default_expr:
+            resolved[arg_def.name] = default_file_arg_stem(pass_def, arg_def)
+            continue
+        if arg_def.type_name == "outstring":
+            resolved[arg_def.name] = ""
+            continue
+        default_fields = resolved.copy()
+        resolved[arg_def.name] = render_template(arg_def.default_expr, default_fields, caller_counters, caller_helper_functions)
+    return resolved
 
 
 def call_pass_func(
@@ -2300,6 +2607,7 @@ def call_pass_func(
             name=func_def.name,
             callable_name=None,
             block_keyword=func_def.name,
+            arg_defs=[],
             schema=[],
             init_vars={},
             output_params=[],
@@ -2346,6 +2654,7 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
 
     translated = re.sub(r"\b([A-Za-z_]\w*)\+\+", lambda m: f'__post_inc__("{m.group(1)}")', expr)
     safe_builtins = {
+        "__import__": __import__,
         "abs": abs,
         "bool": bool,
         "float": float,
@@ -2366,10 +2675,19 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
     scope.update(safe_builtins)
     scope["identifier_suffix"] = identifier_suffix
     scope["__post_inc__"] = post_inc
+    import_paths = []
+    cwd = Path.cwd().resolve()
+    if cwd not in import_paths:
+        import_paths.append(cwd)
+    previous_sys_path = list(sys.path)
+    for path in reversed(import_paths):
+        sys.path.insert(0, str(path))
     try:
         value = eval(translated, {"__builtins__": {}}, scope)
     except Exception:
         return None
+    finally:
+        sys.path[:] = previous_sys_path
     if value is None:
         return ""
     return str(value)
@@ -2751,6 +3069,61 @@ def split_top_level(expr: str, separator: str) -> list[str]:
     return parts
 
 
+def split_top_level_extended(expr: str, separator: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    in_string = False
+    string_quote = ""
+    escape = False
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+
+    for i, ch in enumerate(expr):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if in_string:
+            if ch == string_quote:
+                in_string = False
+                string_quote = ""
+            continue
+        if ch in ("'", '"'):
+            in_string = True
+            string_quote = ch
+            continue
+        if ch == "(":
+            paren_depth += 1
+            continue
+        if ch == ")":
+            paren_depth -= 1
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            continue
+        if ch == "]":
+            bracket_depth -= 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+            continue
+        if ch == "}":
+            brace_depth -= 1
+            continue
+        if ch == separator and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+            parts.append(expr[start:i].strip())
+            start = i + 1
+
+    if not parts:
+        return [expr]
+
+    parts.append(expr[start:].strip())
+    return parts
+
+
 def render_template(template: str, fields: dict[str, str], counters: dict, helper_functions: dict[str, object]) -> str:
     rendered = render_expr(template, fields, counters, helper_functions)
     if rendered is not None:
@@ -2791,7 +3164,7 @@ def execute_instance_ops(
     local_output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
-    helper_call_stack: list[tuple[str, str]] | None = None,
+    helper_call_stack: list[tuple[str, str, str]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
@@ -2826,20 +3199,17 @@ def execute_instance_ops(
             continue
 
         if op.kind == "call":
-            if op.helper_name is None or op.input_expr is None or op.output_targets is None:
+            if op.helper_name is None or op.input_expr is None:
                 continue
             helper_def = helper_defs.get(op.helper_name)
-            if helper_def is None:
-                raise ValueError(f"Unknown local pass {op.helper_name!r}")
-            if len(op.output_targets) != len(helper_def.output_params):
-                raise ValueError(
-                    f"Local pass {op.helper_name} expects {len(helper_def.output_params)} outputs, got {len(op.output_targets)}"
-                )
-            bound_outputs = {
-                param: resolve_output_sink(target, local_output_bindings, global_accs)
-                for param, target in zip(helper_def.output_params, op.output_targets)
-            }
+            external_pass_def = None
+            if helper_def is None and external_pass_defs is not None:
+                external_pass_def = external_pass_defs.get(op.helper_name)
+            if helper_def is None and external_pass_def is None:
+                raise ValueError(f"Unknown pass {op.helper_name!r}")
             if op.input_expr.startswith("@pass:"):
+                if helper_def is None:
+                    raise ValueError(f"@pass: calls require a local helper pass, found external pass {op.helper_name!r}")
                 pass_id = op.input_expr[len("@pass:"):].strip()
                 if global_pass_instances is None:
                     raise ValueError(f"Global pass instances are not available for local pass {op.helper_name}")
@@ -2851,40 +3221,40 @@ def execute_instance_ops(
                     source_instances,
                     fields,
                     counters,
+                    helper_functions,
                     helper_defs,
-                    bound_outputs,
+                    local_output_bindings,
                     global_accs,
                     global_pass_instances,
                     helper_call_stack,
                     external_pass_defs,
                     external_pass_index_bases,
                     external_pass_generated_counts,
+                    op.arg_overrides,
                 )
             else:
                 input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
                 execute_named_pass(
-                    helper_def,
+                    helper_def if helper_def is not None else external_pass_def,
                     input_text,
                     fields,
                     counters,
+                    helper_functions,
                     helper_defs,
-                    bound_outputs,
+                    local_output_bindings,
                     global_accs,
                     global_pass_instances,
                     helper_call_stack,
                     external_pass_defs,
                     external_pass_index_bases,
                     external_pass_generated_counts,
+                    op.arg_overrides,
                 )
             continue
 
         if op.kind == "invoke":
             if op.helper_name is None or op.input_expr is None:
                 continue
-            if op.helper_name in helper_defs:
-                raise ValueError(
-                    f"Local pass {op.helper_name!r} requires explicit output bindings; use {op.helper_name}[...](...)"
-                )
             if external_pass_defs is None:
                 raise ValueError(f"External pass invocation is not available for {op.helper_name!r}")
             external_pass_def = external_pass_defs.get(op.helper_name)
@@ -2896,14 +3266,16 @@ def execute_instance_ops(
                 input_text,
                 fields,
                 counters,
+                helper_functions,
                 helper_defs,
-                {},
+                local_output_bindings,
                 global_accs,
                 global_pass_instances,
                 helper_call_stack,
                 external_pass_defs,
                 external_pass_index_bases,
                 external_pass_generated_counts,
+                op.arg_overrides,
             )
             continue
 
@@ -2931,6 +3303,7 @@ def execute_instance_ops(
                     name=pass_def.name,
                     callable_name=pass_def.callable_name,
                     block_keyword=pass_def.block_keyword,
+                    arg_defs=pass_def.arg_defs,
                     schema=pass_def.schema,
                     init_vars=pass_def.init_vars,
                     output_params=pass_def.output_params,
@@ -2963,14 +3336,16 @@ def execute_named_pass(
     input_text: str,
     outer_fields: dict[str, str],
     outer_counters: dict,
+    caller_helper_functions: dict[str, object],
     helper_defs: dict[str, PassDef],
     output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
-    helper_call_stack: list[tuple[str, str]] | None = None,
+    helper_call_stack: list[tuple[str, str, str]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
+    arg_override_exprs: dict[str, str] | None = None,
 ) -> None:
     import copy
 
@@ -2990,14 +3365,14 @@ def execute_named_pass(
     scoped_helper_defs.update(pass_def.local_helper_defs)
 
     helper_name = pass_def.name or pass_def.callable_name or "<unnamed>"
-    call_signature = (helper_name, input_text)
+    call_signature = (helper_name, input_text, stable_json_dumps(arg_override_exprs or {}))
     if call_signature in helper_call_stack:
         cycle_start = helper_call_stack.index(call_signature)
         cycle = helper_call_stack[cycle_start:] + [call_signature]
         cycle_lines = []
-        for cycle_name, cycle_input in cycle:
+        for cycle_name, cycle_input, cycle_args in cycle:
             snippet = cycle_input[:80].replace("\n", "\\n").replace("\r", "\\r")
-            cycle_lines.append(f"{cycle_name}({snippet!r})")
+            cycle_lines.append(f"{cycle_name}({snippet!r}, args={cycle_args})")
         raise ValueError(
             "Recursive local pass call made no progress:\n  " + "\n  ".join(cycle_lines)
         )
@@ -3033,6 +3408,14 @@ def execute_named_pass(
 
             end, fields = matched
             fields = apply_missing_schema_captures(fields, pass_def.schema)
+            fields = resolve_pass_arg_values(
+                pass_def,
+                fields,
+                outer_fields,
+                outer_counters,
+                caller_helper_functions,
+                arg_override_exprs,
+            )
             if end <= 0:
                 if skip_c_whitespace(item_text, 0) == len(item_text):
                     continue
@@ -3067,12 +3450,14 @@ def execute_named_pass(
                 counters["index"] = outer_counters["index"]
             else:
                 counters["index"] = outer_counters["index"] + local_index
+            bound_outputs = bind_file_arg_outputs(pass_def, fields, output_bindings, global_accs)
+            bound_outputs = bind_outstring_arg_outputs(pass_def, arg_override_exprs, bound_outputs, global_accs)
             execute_instance_ops(
                 pass_def,
                 fields,
                 counters,
                 scoped_helper_defs,
-                output_bindings,
+                bound_outputs,
                 global_accs,
                 global_pass_instances,
                 helper_call_stack,
@@ -3090,14 +3475,16 @@ def execute_pass_instance_helper(
     source_instances: list[dict[str, str]],
     outer_fields: dict[str, str],
     outer_counters: dict,
+    caller_helper_functions: dict[str, object],
     helper_defs: dict[str, PassDef],
     output_bindings: dict[str, list[str]],
     global_accs: dict[str, list[str]],
     global_pass_instances: dict[str, list[dict[str, str]]] | None = None,
-    helper_call_stack: list[tuple[str, str]] | None = None,
+    helper_call_stack: list[tuple[str, str, str]] | None = None,
     external_pass_defs: dict[str, PassDef] | None = None,
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
+    arg_override_exprs: dict[str, str] | None = None,
 ) -> None:
     import copy
 
@@ -3122,15 +3509,25 @@ def execute_pass_instance_helper(
     for local_index, instance_fields in enumerate(source_instances):
         fields = outer_fields.copy()
         fields.update(instance_fields)
+        fields = resolve_pass_arg_values(
+            pass_def,
+            fields,
+            outer_fields,
+            outer_counters,
+            caller_helper_functions,
+            arg_override_exprs,
+        )
         counters = clone_codegen_state_dict(state)
         counters.update(outer_counters)
         counters["index"] = local_index
+        bound_outputs = bind_file_arg_outputs(pass_def, fields, output_bindings, global_accs)
+        bound_outputs = bind_outstring_arg_outputs(pass_def, arg_override_exprs, bound_outputs, global_accs)
         execute_instance_ops(
             pass_def,
             fields,
             counters,
             helper_defs,
-            output_bindings,
+            bound_outputs,
             global_accs,
             global_pass_instances,
             helper_call_stack,
@@ -3174,8 +3571,10 @@ def render_fragments(
     for key, value in pass_def.init_vars.items():
         if isinstance(value, list):
             accs.setdefault(key, []).extend(copy.deepcopy(value))
+    helper_functions: dict[str, object] = dict(pass_def.init_vars)
+    helper_functions.update(pass_def.local_func_defs)
 
-    for index, fields in enumerate(instances):
+    for index, instance_fields in enumerate(instances):
         counters["local_index"] = index
         if index_base_expr is None:
             counters["index"] = index
@@ -3183,7 +3582,9 @@ def render_fragments(
             counters["index"] = SymbolicExpr(index_base_expr)
         else:
             counters["index"] = SymbolicExpr(f"({index_base_expr} + {index})")
-        execute_instance_ops(pass_def, fields, counters, helper_defs, {}, accs, global_pass_instances, None, external_pass_defs, external_pass_index_bases, external_pass_generated_counts)
+        fields = resolve_pass_arg_values(pass_def, instance_fields, instance_fields, counters, helper_functions)
+        bound_outputs = bind_file_arg_outputs(pass_def, fields, {}, accs)
+        execute_instance_ops(pass_def, fields, counters, helper_defs, bound_outputs, accs, global_pass_instances, None, external_pass_defs, external_pass_index_bases, external_pass_generated_counts)
 
     fragments = {}
     for key, value in accs.items():
@@ -3277,7 +3678,7 @@ def compile_pass_inventory(
         pass_name = sanitize_path_token(rel_file.stem)
         pass_id = pass_name
         outputs = []
-        output_targets = collect_declared_output_targets(pass_def.instance_ops)
+        output_targets = list(dict.fromkeys(pass_def.instance_targets or collect_declared_output_targets(pass_def.instance_ops)))
         for target in output_targets:
             rel_output = rel_output_path_for_target(
                 target,
@@ -3456,17 +3857,30 @@ def build_loaded_pass_descriptor_fingerprint(loaded_passes: list[tuple[dict, Pas
     return hash_text(stable_json_dumps(descriptor_entries))
 
 
+def build_codegen_tool_state_fingerprint(build_root: Path) -> str:
+    stamp_path = build_root.parent / "stamps" / "codegen_tool_state.stamp"
+    if not stamp_path.exists():
+        return ""
+    try:
+        stat = stamp_path.stat()
+    except Exception:
+        return ""
+    return f"{int(stat.st_mtime_ns)}:{int(stat.st_size)}"
+
+
 def build_process_state_fingerprint(
     rel_file: Path,
     source_text: str,
     loaded_pass_fingerprint: str,
     prefix_state_fingerprint: str,
+    codegen_tool_state_fingerprint: str,
 ) -> str:
     payload = {
         "file": rel_file.as_posix(),
         "source_sha1": hash_text(source_text),
         "passes_sha1": loaded_pass_fingerprint,
         "prefix_state_sha1": prefix_state_fingerprint,
+        "tool_state_sha1": codegen_tool_state_fingerprint,
     }
     return hash_text(stable_json_dumps(payload))
 
@@ -3580,7 +3994,7 @@ def write_pass_file_shards(
     rendered_fragments: dict[str, str] | None = None,
     instance_count_override: int | None = None,
 ) -> list[Path]:
-    output_targets = entry.get("output_targets", collect_declared_output_targets(pass_def.instance_ops))
+    output_targets = entry.get("output_targets", list(dict.fromkeys(pass_def.instance_targets or collect_declared_output_targets(pass_def.instance_ops))))
     written_paths: list[Path] = []
     outputs = entry.get("outputs", [])
     if len(outputs) != len(output_targets):
@@ -4009,11 +4423,13 @@ def main(argv: list[str] | None = None) -> int:
                 prefix_state_fingerprint = build_count_fingerprint(prefix_count_by_pass_id)
 
         loaded_pass_fingerprint = build_loaded_pass_descriptor_fingerprint(loaded_passes)
+        codegen_tool_state_fingerprint = build_codegen_tool_state_fingerprint(build_root)
         current_input_fingerprint = build_process_state_fingerprint(
             rel_from_shared_root,
             source,
             loaded_pass_fingerprint,
             prefix_state_fingerprint,
+            codegen_tool_state_fingerprint,
         )
         shared_out_path = shared_output_root / rel_from_shared_parent
         current_state = load_process_state(build_root, rel_from_shared_root)
@@ -4171,10 +4587,21 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"No $pass block found under {shared_dir}")
 
     pass_defs: dict[str, PassDef] = {}
+    callable_names: dict[str, Path] = {}
     for block in pass_blocks:
         preprocessed_pass_text = preprocess_pass_text(block.text, define_map, block.file)
         pass_def = compile_pass(preprocessed_pass_text, block.file)
-        key = f"__top_level__:{len(pass_defs)}"
+        rel_file = block.file.relative_to(shared_dir)
+        key = sanitize_path_token(rel_file.with_suffix("").as_posix().replace("/", "_"))
+        if key in pass_defs:
+            raise ValueError(f"Duplicate pass id {key!r} from {block.file}")
+        if pass_def.callable_name is not None:
+            existing_file = callable_names.get(pass_def.callable_name)
+            if existing_file is not None:
+                raise ValueError(
+                    f"Duplicate named top-level pass {pass_def.callable_name!r} in {existing_file} and {block.file}"
+                )
+            callable_names[pass_def.callable_name] = block.file
         pass_defs[key] = pass_def
         block.replacement = ""
 
@@ -4183,6 +4610,7 @@ def main(argv: list[str] | None = None) -> int:
 
     global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes, legacy_soa_defs)
     for pass_name, values in global_instances_by_pass.items():
+        instances_by_pass.setdefault(pass_name, [])
         instances_by_pass[pass_name].extend(values)
     external_pass_defs = {
         pass_def.callable_name: pass_def
