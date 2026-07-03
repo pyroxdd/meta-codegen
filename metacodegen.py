@@ -84,6 +84,34 @@ class SchemaPart:
     capture_name: str | None = None
 
 
+@dataclass
+class BuiltinSoaField:
+    kind: str
+    type_expr: str
+    name: str
+    default_expr: str = ""
+    params_expr: str = ""
+    param_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BuiltinSoaDef:
+    name: str
+    file: Path
+    include_path: str
+    generated_rel_path: str
+    fields: list["BuiltinSoaField"]
+
+
+@dataclass
+class BuiltinSoaRow:
+    soa_name: str
+    name: str
+    file: Path
+    assignments: dict[str, str]
+    switch_bodies: dict[str, str]
+
+
 TRUTHY_DEFINE_VALUES = {"1", "true", "yes", "on"}
 FALSY_DEFINE_VALUES = {"", "0", "false", "no", "off"}
 
@@ -1280,6 +1308,386 @@ def expand_builtin_blocks(blocks: list[MarkerBlock]) -> list[MarkerBlock]:
     return expanded
 
 
+def builtin_soa_generated_rel_path(name: str, generated_header_root: str, generated_header_prefix: str) -> str:
+    file_name = f"{generated_header_prefix}soa_{name}.h"
+    if generated_header_root:
+        return (Path(generated_header_root) / file_name).as_posix()
+    return file_name
+
+
+def block_leading_keyword(text: str) -> str | None:
+    match = re.match(r"\s*([A-Za-z_]\w*)", text)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def parse_builtin_soa_param_names(params_expr: str, file: Path, context: str) -> list[str]:
+    params_expr = params_expr.strip()
+    if not params_expr:
+        return []
+
+    names: list[str] = []
+    for raw_param in params_expr.split(","):
+        param = raw_param.strip()
+        if not param:
+            raise ValueError(f"Invalid empty SOA parameter in {context} in {file}")
+        param = re.sub(r"\s*=\s*.*$", "", param).strip()
+        match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*$", param)
+        if match is None:
+            raise ValueError(f"Could not determine parameter name for SOA parameter {param!r} in {context} in {file}")
+        names.append(match.group(1))
+    return names
+
+
+def parse_builtin_soa_definition_block(
+    block: MarkerBlock,
+    generated_header_root: str,
+    generated_header_prefix: str,
+) -> BuiltinSoaDef | None:
+    text = block.text.strip()
+    match = re.fullmatch(r"soa\s+([A-Za-z_]\w*)\s*\{(.*)\}\s*;?", text, re.DOTALL)
+    if match is None:
+        return None
+
+    soa_name = match.group(1)
+    body = match.group(2)
+    fields: list[BuiltinSoaField] = []
+    seen_names: set[str] = set()
+
+    for item in iter_top_level_items(body):
+        field_text = item.strip()
+        if not field_text:
+            continue
+
+        switch_match = re.fullmatch(
+            r"switch\s+(.+?)\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*;",
+            field_text,
+            re.DOTALL,
+        )
+        if switch_match is not None:
+            return_type = switch_match.group(1).strip()
+            field_name = switch_match.group(2)
+            params_expr = switch_match.group(3).strip()
+            if return_type != "void":
+                raise ValueError(f"SOA switch field {soa_name}.{field_name} in {block.file} must currently return void")
+            if field_name in seen_names:
+                raise ValueError(f"Duplicate SOA field {soa_name}.{field_name} in {block.file}")
+            seen_names.add(field_name)
+            fields.append(BuiltinSoaField(
+                kind="switch",
+                type_expr=return_type,
+                name=field_name,
+                params_expr=params_expr,
+                param_names=parse_builtin_soa_param_names(params_expr, block.file, f"{soa_name}.{field_name}"),
+            ))
+            continue
+
+        regular_match = re.fullmatch(
+            r"(.+?)\s+([A-Za-z_]\w*)\s*=\s*(.+);",
+            field_text,
+            re.DOTALL,
+        )
+        if regular_match is None:
+            raise ValueError(f"Invalid SOA field declaration {field_text!r} in {block.file}")
+
+        type_expr = regular_match.group(1).strip()
+        field_name = regular_match.group(2)
+        default_expr = regular_match.group(3).strip()
+        if field_name in seen_names:
+            raise ValueError(f"Duplicate SOA field {soa_name}.{field_name} in {block.file}")
+        seen_names.add(field_name)
+        fields.append(BuiltinSoaField(
+            kind="regular",
+            type_expr=type_expr,
+            name=field_name,
+            default_expr=default_expr,
+        ))
+
+    if not fields:
+        raise ValueError(f"SOA {soa_name!r} in {block.file} must declare at least one field")
+
+    generated_rel_path = builtin_soa_generated_rel_path(soa_name, generated_header_root, generated_header_prefix)
+    return BuiltinSoaDef(
+        name=soa_name,
+        file=block.file,
+        include_path=generated_rel_path,
+        generated_rel_path=generated_rel_path,
+        fields=fields,
+    )
+
+
+def parse_builtin_soa_row_block(block: MarkerBlock, soa_def: BuiltinSoaDef) -> BuiltinSoaRow:
+    text = block.text.strip()
+    match = re.fullmatch(rf"{re.escape(soa_def.name)}\s+([A-Za-z_]\w*)\s*\{{(.*)\}}\s*;?", text, re.DOTALL)
+    if match is None:
+        raise ValueError(f"Invalid ${soa_def.name} row block in {block.file}")
+
+    row_name = match.group(1)
+    body = match.group(2)
+    field_by_name = {field.name: field for field in soa_def.fields}
+    assignments: dict[str, str] = {}
+    switch_bodies: dict[str, str] = {}
+
+    for item in iter_top_level_items(body):
+        entry_text = item.strip()
+        if not entry_text:
+            continue
+
+        assign_match = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.+);", entry_text, re.DOTALL)
+        if assign_match is not None:
+            field_name = assign_match.group(1)
+            field = field_by_name.get(field_name)
+            if field is None:
+                raise ValueError(f"Unknown SOA field {soa_def.name}.{field_name} in {block.file}")
+            if field.kind != "regular":
+                raise ValueError(f"SOA switch field {soa_def.name}.{field_name} requires a function body in {block.file}")
+            if field_name in assignments:
+                raise ValueError(f"Duplicate SOA assignment for {soa_def.name}.{field_name} in {block.file}")
+            assignments[field_name] = assign_match.group(2).strip()
+            continue
+
+        switch_match = re.fullmatch(r"([A-Za-z_]\w*)\s*(?:\((.*?)\))?\s*\{(.*)\}", entry_text, re.DOTALL)
+        if switch_match is not None:
+            field_name = switch_match.group(1)
+            field = field_by_name.get(field_name)
+            if field is None:
+                raise ValueError(f"Unknown SOA field {soa_def.name}.{field_name} in {block.file}")
+            if field.kind != "switch":
+                raise ValueError(f"SOA regular field {soa_def.name}.{field_name} requires an assignment in {block.file}")
+            params_expr = (switch_match.group(2) or "").strip()
+            if params_expr != field.params_expr:
+                raise ValueError(
+                    f"SOA switch body {soa_def.name}.{field_name} in {block.file} must match declared parameter list "
+                    f"({field.params_expr!r})"
+                )
+            if field_name in switch_bodies:
+                raise ValueError(f"Duplicate SOA switch body for {soa_def.name}.{field_name} in {block.file}")
+            switch_bodies[field_name] = switch_match.group(3).strip()
+            continue
+
+        raise ValueError(f"Invalid SOA row entry {entry_text!r} in {block.file}")
+
+    return BuiltinSoaRow(
+        soa_name=soa_def.name,
+        name=row_name,
+        file=block.file,
+        assignments=assignments,
+        switch_bodies=switch_bodies,
+    )
+
+
+def collect_builtin_soa_inventory(
+    shared_dir: Path,
+    source_suffixes: tuple[str, ...],
+    generated_header_root: str,
+    generated_header_prefix: str,
+) -> tuple[dict[str, BuiltinSoaDef], dict[str, list[BuiltinSoaRow]]]:
+    raw_blocks: list[MarkerBlock] = []
+    for file in iter_source_files(shared_dir, source_suffixes):
+        source = file.read_text()
+        for start in marker_positions(source):
+            end = block_end(source, start)
+            text = source[start + MARKER_LEN:end]
+            raw_blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
+
+    soa_defs: dict[str, BuiltinSoaDef] = {}
+    for block in raw_blocks:
+        soa_def = parse_builtin_soa_definition_block(block, generated_header_root, generated_header_prefix)
+        if soa_def is None:
+            continue
+        existing = soa_defs.get(soa_def.name)
+        if existing is not None:
+            raise ValueError(f"Duplicate SOA {soa_def.name!r} in {existing.file} and {block.file}")
+        soa_defs[soa_def.name] = soa_def
+
+    rows_by_soa = {name: [] for name in soa_defs}
+    for block in expand_builtin_blocks(raw_blocks):
+        keyword = block_leading_keyword(block.text)
+        if keyword is None:
+            continue
+        if keyword == "soa":
+            continue
+        soa_def = soa_defs.get(keyword)
+        if soa_def is None:
+            continue
+        rows_by_soa[keyword].append(parse_builtin_soa_row_block(block, soa_def))
+
+    return soa_defs, rows_by_soa
+
+
+def builtin_soa_descriptor_path(build_root: Path, soa_name: str) -> Path:
+    return build_root / f"builtin_soa_{soa_name}.json"
+
+
+def write_builtin_soa_descriptor(build_root: Path, soa_def: BuiltinSoaDef) -> None:
+    descriptor = {
+        "name": soa_def.name,
+        "source_file": str(soa_def.file),
+        "include_path": soa_def.include_path,
+        "generated_rel_path": soa_def.generated_rel_path,
+        "fields": [
+            {
+                "kind": field.kind,
+                "type_expr": field.type_expr,
+                "name": field.name,
+                "default_expr": field.default_expr,
+                "params_expr": field.params_expr,
+                "param_names": field.param_names,
+            }
+            for field in soa_def.fields
+        ],
+    }
+    write_text_if_changed(builtin_soa_descriptor_path(build_root, soa_def.name), stable_json_dumps(descriptor) + "\n")
+
+
+def load_builtin_soa_defs_from_build_root(build_root: Path) -> dict[str, BuiltinSoaDef]:
+    soa_defs: dict[str, BuiltinSoaDef] = {}
+    for path in sorted(build_root.glob("builtin_soa_*.json")):
+        data = json.loads(path.read_text())
+        soa_defs[data["name"]] = BuiltinSoaDef(
+            name=data["name"],
+            file=Path(data["source_file"]),
+            include_path=data["include_path"],
+            generated_rel_path=data.get("generated_rel_path", data["include_path"]),
+            fields=[
+                BuiltinSoaField(
+                    kind=field["kind"],
+                    type_expr=field["type_expr"],
+                    name=field["name"],
+                    default_expr=field.get("default_expr", ""),
+                    params_expr=field.get("params_expr", ""),
+                    param_names=list(field.get("param_names", [])),
+                )
+                for field in data.get("fields", [])
+            ],
+        )
+    return soa_defs
+
+
+def remove_stale_builtin_soa_artifacts(build_root: Path, output_root: Path | None, active_defs: dict[str, BuiltinSoaDef]) -> None:
+    build_root.mkdir(parents=True, exist_ok=True)
+    active_descriptor_names = {f"builtin_soa_{name}.json" for name in active_defs}
+    for path in build_root.glob("builtin_soa_*.json"):
+        if path.name in active_descriptor_names:
+            continue
+        generated_rel_path = None
+        try:
+            data = json.loads(path.read_text())
+            generated_rel_path = data.get("generated_rel_path")
+        except Exception:
+            generated_rel_path = None
+        path.unlink()
+        if generated_rel_path and output_root is not None:
+            generated_path = output_root / generated_rel_path
+            if generated_path.exists():
+                generated_path.unlink()
+
+
+def render_builtin_soa_header(soa_def: BuiltinSoaDef, rows: list[BuiltinSoaRow]) -> str:
+    regular_fields = [field for field in soa_def.fields if field.kind == "regular"]
+    switch_fields = [field for field in soa_def.fields if field.kind == "switch"]
+
+    lines: list[str] = ["#pragma once", ""]
+    lines.append(f"namespace {soa_def.name}_soa {{")
+    lines.append(f"static constexpr uint16 count = {len(rows) + 1};")
+    for field in regular_fields:
+        values = [field.default_expr]
+        for row in rows:
+            values.append(row.assignments.get(field.name, field.default_expr))
+        joined_values = ", ".join(values)
+        lines.append(f"static constexpr {field.type_expr} {field.name}_by_id[count] = {{ {joined_values} }};")
+    lines.append("}")
+    lines.append("")
+
+    for field in regular_fields:
+        lines.append(f"inline {field.type_expr} {soa_def.name}_{field.name}_from_id(uint16 id) {{")
+        lines.append(f"if (id < {soa_def.name}_soa::count) {{")
+        lines.append(f"return {soa_def.name}_soa::{field.name}_by_id[id];")
+        lines.append("}")
+        lines.append(f"return {field.default_expr};")
+        lines.append("}")
+        lines.append("")
+
+    for field in switch_fields:
+        params_suffix = f", {field.params_expr}" if field.params_expr else ""
+        lines.append(f"inline void {soa_def.name}_{field.name}_from_id(uint16 id{params_suffix}) {{")
+        lines.append("switch (id) {")
+        for index, row in enumerate(rows, start=1):
+            body = row.switch_bodies.get(field.name)
+            if body is None:
+                continue
+            lines.append(f"case {index}: {{")
+            if body:
+                lines.append(body)
+            lines.append("break;")
+            lines.append("}")
+        lines.append("default:")
+        lines.append("break;")
+        lines.append("}")
+        lines.append("}")
+        lines.append("")
+
+    lines.append(f"struct {soa_def.name} {{")
+    lines.append("static constexpr uint16 invalid_id = 0;")
+    lines.append("uint16 id;")
+    lines.append(f"constexpr {soa_def.name}() : id(invalid_id) {{}}")
+    lines.append(f"constexpr {soa_def.name}(uint16 id_value) : id(id_value) {{}}")
+    lines.append(f"constexpr bool operator==(const {soa_def.name}& other) const {{ return id == other.id; }}")
+    lines.append(f"constexpr bool operator!=(const {soa_def.name}& other) const {{ return id != other.id; }}")
+    lines.append("constexpr bool valid() const { return id != invalid_id; }")
+    for field in regular_fields:
+        lines.append(f"{field.type_expr} get_{field.name}() const {{ return {soa_def.name}_{field.name}_from_id(id); }}")
+    for field in switch_fields:
+        params_decl = field.params_expr
+        args = ", ".join(field.param_names)
+        call_suffix = f", {args}" if args else ""
+        lines.append(f"void {field.name}({params_decl}) const {{ {soa_def.name}_{field.name}_from_id(id{call_suffix}); }}")
+    lines.append("};")
+    if rows:
+        lines.append("")
+        for index, row in enumerate(rows, start=1):
+            lines.append(f"static constexpr {soa_def.name} {soa_def.name}_{row.name} = {{ {index} }};")
+    lines.append("")
+    return format_cpp_like("\n".join(lines))
+
+
+def write_builtin_soa_headers(output_root: Path, soa_defs: dict[str, BuiltinSoaDef], rows_by_soa: dict[str, list[BuiltinSoaRow]]) -> list[Path]:
+    written_paths: list[Path] = []
+    for soa_name, soa_def in soa_defs.items():
+        out_path = output_root / soa_def.generated_rel_path
+        content = render_builtin_soa_header(soa_def, rows_by_soa.get(soa_name, []))
+        if write_text_if_changed(out_path, content):
+            print(f"Written: {out_path}")
+        written_paths.append(out_path)
+    return written_paths
+
+
+def filter_builtin_blocks(blocks: list[MarkerBlock], raw_blocks: list[MarkerBlock], soa_defs: dict[str, BuiltinSoaDef]) -> list[MarkerBlock]:
+    for block in raw_blocks:
+        soa_def = parse_builtin_soa_definition_block(block, "", "")
+        if soa_def is not None:
+            descriptor = soa_defs.get(soa_def.name)
+            if descriptor is None:
+                raise ValueError(f"Unknown SOA {soa_def.name!r} referenced in {block.file}")
+            block.replacement = f'#include "{descriptor.include_path}"'
+            continue
+
+        keyword = block_leading_keyword(block.text)
+        if keyword is not None and keyword in soa_defs:
+            block.replacement = ""
+
+    filtered: list[MarkerBlock] = []
+    for block in blocks:
+        keyword = block_leading_keyword(block.text)
+        if keyword == "soa":
+            continue
+        if keyword is not None and keyword in soa_defs:
+            continue
+        filtered.append(block)
+    return filtered
+
+
 def iter_source_files(shared_dir: Path, source_suffixes: tuple[str, ...]) -> list[Path]:
     suffixes = {suffix.lower() for suffix in source_suffixes}
     return [
@@ -1292,6 +1700,7 @@ def iter_source_files(shared_dir: Path, source_suffixes: tuple[str, ...]) -> lis
 def discover_blocks(
     shared_dir: Path,
     source_suffixes: tuple[str, ...],
+    soa_defs: dict[str, BuiltinSoaDef] | None = None,
 ) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
     raw_blocks = []
     strip_blocks: dict[Path, list[MarkerBlock]] = {}
@@ -1306,16 +1715,20 @@ def discover_blocks(
             raw_blocks.append(block)
             strip_blocks.setdefault(file, []).append(block)
 
-    return expand_builtin_blocks(raw_blocks), strip_blocks
+    expanded_blocks = expand_builtin_blocks(raw_blocks)
+    if soa_defs:
+        expanded_blocks = filter_builtin_blocks(expanded_blocks, raw_blocks, soa_defs)
+    return expanded_blocks, strip_blocks
 
 
 def collect_instances_by_pass(
     shared_dir: Path,
     pass_defs: dict[str, PassDef],
     source_suffixes: tuple[str, ...],
+    soa_defs: dict[str, BuiltinSoaDef] | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     instances_by_pass = {name: [] for name in pass_defs}
-    blocks, _ = discover_blocks(shared_dir, source_suffixes)
+    blocks, _ = discover_blocks(shared_dir, source_suffixes, soa_defs)
     for block in blocks:
         stripped = block.text.lstrip()
         if stripped.startswith("pass"):
@@ -2934,7 +3347,7 @@ def remove_stale_pass_artifacts(build_root: Path, active_ids: set[str]) -> None:
             print(f"Removed stale pass artifact: {path}")
 
 
-def discover_blocks_in_file(file: Path) -> tuple[list[MarkerBlock], list[MarkerBlock], str]:
+def discover_blocks_in_file(file: Path, soa_defs: dict[str, BuiltinSoaDef] | None = None) -> tuple[list[MarkerBlock], list[MarkerBlock], str]:
     source = file.read_text()
     raw_blocks: list[MarkerBlock] = []
     positions = marker_positions(source)
@@ -2942,7 +3355,10 @@ def discover_blocks_in_file(file: Path) -> tuple[list[MarkerBlock], list[MarkerB
         end = block_end(source, start)
         text = source[start + MARKER_LEN:end]
         raw_blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
-    return expand_builtin_blocks(raw_blocks), raw_blocks.copy(), source
+    expanded_blocks = expand_builtin_blocks(raw_blocks)
+    if soa_defs:
+        expanded_blocks = filter_builtin_blocks(expanded_blocks, raw_blocks, soa_defs)
+    return expanded_blocks, raw_blocks.copy(), source
 
 
 def iter_pass_descriptor_paths(build_root: Path) -> list[Path]:
@@ -3498,10 +3914,51 @@ def main(argv: list[str] | None = None) -> int:
         for entry in entries:
             descriptor_path = args.build_root / f"pass_{entry['id']}.json"
             write_pass_descriptor(descriptor_path, entry)
+        soa_defs: dict[str, BuiltinSoaDef] = {}
+        rows_by_soa: dict[str, list[BuiltinSoaRow]] = {}
+        if args.shared_dir is not None and args.output_root is not None:
+            soa_defs, rows_by_soa = collect_builtin_soa_inventory(
+                args.shared_dir.resolve(),
+                source_suffixes,
+                args.generated_header_root,
+                args.generated_header_prefix,
+            )
+        remove_stale_builtin_soa_artifacts(
+            args.build_root.resolve(),
+            args.output_root.resolve() if args.output_root is not None else None,
+            soa_defs,
+        )
+        for soa_def in soa_defs.values():
+            write_builtin_soa_descriptor(args.build_root.resolve(), soa_def)
         if args.shared_dir is not None and args.output_root is not None:
             write_public_output_headers(entries, args.output_root.resolve())
+            write_builtin_soa_headers(args.output_root.resolve(), soa_defs, rows_by_soa)
         if args.stamp is not None:
-            write_stamp_if_changed(args.stamp.resolve(), hash_text(stable_json_dumps(entries)))
+            soa_stamp_entries = [
+                {
+                    "name": soa_def.name,
+                    "include_path": soa_def.include_path,
+                    "generated_rel_path": soa_def.generated_rel_path,
+                    "fields": [
+                        {
+                            "kind": field.kind,
+                            "type_expr": field.type_expr,
+                            "name": field.name,
+                            "default_expr": field.default_expr,
+                            "params_expr": field.params_expr,
+                            "param_names": field.param_names,
+                        }
+                        for field in soa_def.fields
+                    ],
+                    "row_count": len(rows_by_soa.get(soa_def.name, [])),
+                }
+                for soa_def in soa_defs.values()
+            ]
+            stamp_payload = {
+                "passes": entries,
+                "builtin_soa": soa_stamp_entries,
+            }
+            write_stamp_if_changed(args.stamp.resolve(), hash_text(stable_json_dumps(stamp_payload)))
         return 0
     if args.command == "process-file":
         shared_root = args.shared_root.resolve()
@@ -3515,7 +3972,8 @@ def main(argv: list[str] | None = None) -> int:
         rel_from_shared_parent = input_file.relative_to(shared_root.parent)
         rel_from_shared_root = input_file.relative_to(shared_root)
         loaded_passes = load_pass_defs_from_build_root(build_root)
-        blocks, strip_blocks, source = discover_blocks_in_file(input_file)
+        loaded_soa_defs = load_builtin_soa_defs_from_build_root(build_root)
+        blocks, strip_blocks, source = discover_blocks_in_file(input_file, loaded_soa_defs)
 
         pass_ids = [entry["id"] for entry, _ in loaded_passes]
         pass_defs = {entry["id"]: pass_def for entry, pass_def in loaded_passes}
@@ -3583,7 +4041,12 @@ def main(argv: list[str] | None = None) -> int:
         output_owner_by_fragment = build_output_owner_map(loaded_passes)
         global_instances_by_pass = None
         if uses_global_instances:
-            global_instances_by_pass = collect_instances_by_pass(shared_root, pass_defs, tuple(DEFAULT_SOURCE_SUFFIXES))
+            global_instances_by_pass = collect_instances_by_pass(
+                shared_root,
+                pass_defs,
+                tuple(DEFAULT_SOURCE_SUFFIXES),
+                loaded_soa_defs,
+            )
 
         external_pass_index_bases = {
             pass_def.callable_name: (
@@ -3696,7 +4159,13 @@ def main(argv: list[str] | None = None) -> int:
     stamp_path = args.stamp or (output_root / "content.stamp")
     source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
 
-    blocks, strip_map = discover_blocks(shared_dir, source_suffixes)
+    legacy_soa_defs, _ = collect_builtin_soa_inventory(
+        shared_dir,
+        source_suffixes,
+        args.generated_header_root,
+        args.generated_header_prefix,
+    )
+    blocks, strip_map = discover_blocks(shared_dir, source_suffixes, legacy_soa_defs)
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
     if not pass_blocks:
         raise ValueError(f"No $pass block found under {shared_dir}")
@@ -3712,7 +4181,7 @@ def main(argv: list[str] | None = None) -> int:
     local_helper_count = sum(len(pass_def.local_helper_defs) for pass_def in pass_defs.values())
     instances_by_pass = {name: [] for name in pass_defs}
 
-    global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes)
+    global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes, legacy_soa_defs)
     for pass_name, values in global_instances_by_pass.items():
         instances_by_pass[pass_name].extend(values)
     external_pass_defs = {
@@ -3753,6 +4222,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Written: {out_path}")
 
     write_generated_sources(shared_dir, strip_map, shared_output_root, source_suffixes)
+    write_builtin_soa_headers(output_root, legacy_soa_defs, collect_builtin_soa_inventory(
+        shared_dir,
+        source_suffixes,
+        args.generated_header_root,
+        args.generated_header_prefix,
+    )[1])
     stamp_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_path.write_text("# Generated by codegen\n")
     print(f"Written: {stamp_path}")
