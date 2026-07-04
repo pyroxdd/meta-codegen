@@ -33,6 +33,7 @@ class MarkerBlock:
     end: int
     text: str
     replacement: str = ""
+    is_virtual: bool = False
 
 
 @dataclass
@@ -91,34 +92,6 @@ class SchemaPart:
     alternatives: list[list["SchemaPart"]] | None = None
     alternative_labels: list[str | None] | None = None
     capture_name: str | None = None
-
-
-@dataclass
-class BuiltinSoaField:
-    kind: str
-    type_expr: str
-    name: str
-    default_expr: str = ""
-    params_expr: str = ""
-    param_names: list[str] = field(default_factory=list)
-
-
-@dataclass
-class BuiltinSoaDef:
-    name: str
-    file: Path
-    include_path: str
-    generated_rel_path: str
-    fields: list["BuiltinSoaField"]
-
-
-@dataclass
-class BuiltinSoaRow:
-    soa_name: str
-    name: str
-    file: Path
-    assignments: dict[str, str]
-    switch_bodies: dict[str, str]
 
 
 TRUTHY_DEFINE_VALUES = {"1", "true", "yes", "on"}
@@ -703,6 +676,30 @@ def run_init_python(source: str, file: Path) -> dict:
     return {key: value for key, value in scope.items() if not key.startswith("__")}
 
 
+def extract_pass_python_prelude(body_text: str) -> tuple[str, str]:
+    lines = body_text.splitlines()
+    prelude_lines: list[str] = []
+    body_start = 0
+    saw_python = False
+
+    def is_allowed_python_line(stripped: str) -> bool:
+        if not stripped:
+            return saw_python
+        return stripped.startswith("import ") or stripped.startswith("from ")
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if is_allowed_python_line(stripped):
+            prelude_lines.append(line)
+            if stripped:
+                saw_python = True
+            body_start = idx + 1
+            continue
+        break
+
+    return "\n".join(prelude_lines).strip(), "\n".join(lines[body_start:])
+
+
 def parse_instance_statement(text: str, block_lines: list[str] | None = None) -> InstanceOp:
     decl_match = re.match(r'\s*var\s+([A-Za-z_]\w*)\s*$', text)
     if decl_match:
@@ -1236,6 +1233,7 @@ def compile_nested_pass(pass_text: str, file: Path) -> PassDef:
     pass_name, schema_text, arg_defs, body_text = parse_new_pass_declaration(pass_text, file)
     local_helper_defs: dict[str, PassDef] = {}
     local_func_defs: dict[str, FuncDef] = {}
+    raw_python, body_text = extract_pass_python_prelude(body_text)
 
     body_text, func_texts = extract_top_level_named_blocks(body_text, "func")
     for func_text in func_texts:
@@ -1253,6 +1251,7 @@ def compile_nested_pass(pass_text: str, file: Path) -> PassDef:
 
     init_vars: dict[str, object] = {}
     seed_init_vars_from_arg_defaults(arg_defs, init_vars)
+    init_vars.update(run_init_python(raw_python, file))
     instance_ops = parse_instance_section(body_text)
     declared_aliases = declared_instance_aliases(instance_ops)
     schema = parse_schema_template(schema_text, pass_name, file, init_vars)
@@ -1310,6 +1309,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
     pass_name, schema_text, arg_defs, body_text = parse_new_pass_declaration(pass_text, file)
     local_helper_defs: dict[str, PassDef] = {}
     local_func_defs: dict[str, FuncDef] = {}
+    raw_python, body_text = extract_pass_python_prelude(body_text)
 
     body_text, func_texts = extract_top_level_named_blocks(body_text, "func")
     for func_text in func_texts:
@@ -1327,6 +1327,7 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
 
     init_vars: dict[str, object] = {}
     seed_init_vars_from_arg_defaults(arg_defs, init_vars)
+    init_vars.update(run_init_python(raw_python, file))
     instance_ops = parse_instance_section(body_text)
     declared_aliases = declared_instance_aliases(instance_ops)
     schema = parse_schema_template(schema_text, pass_name, file, init_vars)
@@ -1381,7 +1382,46 @@ def compile_pass(pass_text: str, file: Path) -> PassDef:
 
 
 def marker_positions(source: str) -> list[int]:
-    return [m.start() + 1 for m in re.finditer(re.escape(MARKER), source)]
+    positions: list[int] = []
+    if source.startswith("$"):
+        positions.append(0)
+    positions.extend(m.start() + 1 for m in re.finditer(re.escape(MARKER), source))
+    return positions
+
+
+def parse_marker_blocks_from_source(source: str, file: Path, is_virtual: bool = False) -> list[MarkerBlock]:
+    raw_blocks: list[MarkerBlock] = []
+    for start in marker_positions(source):
+        end = block_end(source, start)
+        text = source[start + MARKER_LEN:end]
+        raw_blocks.append(MarkerBlock(file=file, start=start, end=end, text=text, is_virtual=is_virtual))
+    return raw_blocks
+
+
+def make_virtual_block_file(phase: str, producer: str, emission_index: int) -> Path:
+    safe_phase = sanitize_path_token(phase)
+    safe_producer = sanitize_path_token(producer)
+    return Path("__virtual__") / safe_phase / f"{safe_producer}_{emission_index}.meta"
+
+
+def parse_virtual_top_level_blocks(source: str, phase: str, producer: str) -> list[MarkerBlock]:
+    text = source.strip()
+    if not text:
+        return []
+    virtual_file = make_virtual_block_file(phase, producer, 0)
+    raw_blocks = parse_marker_blocks_from_source(text, virtual_file, is_virtual=True)
+    if not raw_blocks:
+        snippet = text[:80].replace("\n", "\\n").replace("\r", "\\r")
+        raise ValueError(f"top_level in {producer} during {phase} did not emit any $ blocks near {snippet!r}")
+    expanded_blocks = expand_builtin_blocks(raw_blocks)
+    for index, block in enumerate(expanded_blocks):
+        block.file = make_virtual_block_file(phase, producer, index)
+        block.is_virtual = True
+    return expanded_blocks
+
+
+def block_is_pass_declaration(block: MarkerBlock) -> bool:
+    return block.text.lstrip().startswith("pass")
 
 
 def block_end(text: str, start: int) -> int:
@@ -1533,386 +1573,6 @@ def expand_builtin_blocks(blocks: list[MarkerBlock]) -> list[MarkerBlock]:
     return expanded
 
 
-def builtin_soa_generated_rel_path(name: str, generated_header_root: str, generated_header_prefix: str) -> str:
-    file_name = f"{generated_header_prefix}soa_{name}.h"
-    if generated_header_root:
-        return (Path(generated_header_root) / file_name).as_posix()
-    return file_name
-
-
-def block_leading_keyword(text: str) -> str | None:
-    match = re.match(r"\s*([A-Za-z_]\w*)", text)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def parse_builtin_soa_param_names(params_expr: str, file: Path, context: str) -> list[str]:
-    params_expr = params_expr.strip()
-    if not params_expr:
-        return []
-
-    names: list[str] = []
-    for raw_param in params_expr.split(","):
-        param = raw_param.strip()
-        if not param:
-            raise ValueError(f"Invalid empty SOA parameter in {context} in {file}")
-        param = re.sub(r"\s*=\s*.*$", "", param).strip()
-        match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*$", param)
-        if match is None:
-            raise ValueError(f"Could not determine parameter name for SOA parameter {param!r} in {context} in {file}")
-        names.append(match.group(1))
-    return names
-
-
-def parse_builtin_soa_definition_block(
-    block: MarkerBlock,
-    generated_header_root: str,
-    generated_header_prefix: str,
-) -> BuiltinSoaDef | None:
-    text = block.text.strip()
-    match = re.fullmatch(r"soa\s+([A-Za-z_]\w*)\s*\{(.*)\}\s*;?", text, re.DOTALL)
-    if match is None:
-        return None
-
-    soa_name = match.group(1)
-    body = match.group(2)
-    fields: list[BuiltinSoaField] = []
-    seen_names: set[str] = set()
-
-    for item in iter_top_level_items(body):
-        field_text = item.strip()
-        if not field_text:
-            continue
-
-        switch_match = re.fullmatch(
-            r"switch\s+(.+?)\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*;",
-            field_text,
-            re.DOTALL,
-        )
-        if switch_match is not None:
-            return_type = switch_match.group(1).strip()
-            field_name = switch_match.group(2)
-            params_expr = switch_match.group(3).strip()
-            if return_type != "void":
-                raise ValueError(f"SOA switch field {soa_name}.{field_name} in {block.file} must currently return void")
-            if field_name in seen_names:
-                raise ValueError(f"Duplicate SOA field {soa_name}.{field_name} in {block.file}")
-            seen_names.add(field_name)
-            fields.append(BuiltinSoaField(
-                kind="switch",
-                type_expr=return_type,
-                name=field_name,
-                params_expr=params_expr,
-                param_names=parse_builtin_soa_param_names(params_expr, block.file, f"{soa_name}.{field_name}"),
-            ))
-            continue
-
-        regular_match = re.fullmatch(
-            r"(.+?)\s+([A-Za-z_]\w*)\s*=\s*(.+);",
-            field_text,
-            re.DOTALL,
-        )
-        if regular_match is None:
-            raise ValueError(f"Invalid SOA field declaration {field_text!r} in {block.file}")
-
-        type_expr = regular_match.group(1).strip()
-        field_name = regular_match.group(2)
-        default_expr = regular_match.group(3).strip()
-        if field_name in seen_names:
-            raise ValueError(f"Duplicate SOA field {soa_name}.{field_name} in {block.file}")
-        seen_names.add(field_name)
-        fields.append(BuiltinSoaField(
-            kind="regular",
-            type_expr=type_expr,
-            name=field_name,
-            default_expr=default_expr,
-        ))
-
-    if not fields:
-        raise ValueError(f"SOA {soa_name!r} in {block.file} must declare at least one field")
-
-    generated_rel_path = builtin_soa_generated_rel_path(soa_name, generated_header_root, generated_header_prefix)
-    return BuiltinSoaDef(
-        name=soa_name,
-        file=block.file,
-        include_path=generated_rel_path,
-        generated_rel_path=generated_rel_path,
-        fields=fields,
-    )
-
-
-def parse_builtin_soa_row_block(block: MarkerBlock, soa_def: BuiltinSoaDef) -> BuiltinSoaRow:
-    text = block.text.strip()
-    match = re.fullmatch(rf"{re.escape(soa_def.name)}\s+([A-Za-z_]\w*)\s*\{{(.*)\}}\s*;?", text, re.DOTALL)
-    if match is None:
-        raise ValueError(f"Invalid ${soa_def.name} row block in {block.file}")
-
-    row_name = match.group(1)
-    body = match.group(2)
-    field_by_name = {field.name: field for field in soa_def.fields}
-    assignments: dict[str, str] = {}
-    switch_bodies: dict[str, str] = {}
-
-    for item in iter_top_level_items(body):
-        entry_text = item.strip()
-        if not entry_text:
-            continue
-
-        assign_match = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.+);", entry_text, re.DOTALL)
-        if assign_match is not None:
-            field_name = assign_match.group(1)
-            field = field_by_name.get(field_name)
-            if field is None:
-                raise ValueError(f"Unknown SOA field {soa_def.name}.{field_name} in {block.file}")
-            if field.kind != "regular":
-                raise ValueError(f"SOA switch field {soa_def.name}.{field_name} requires a function body in {block.file}")
-            if field_name in assignments:
-                raise ValueError(f"Duplicate SOA assignment for {soa_def.name}.{field_name} in {block.file}")
-            assignments[field_name] = assign_match.group(2).strip()
-            continue
-
-        switch_match = re.fullmatch(r"([A-Za-z_]\w*)\s*(?:\((.*?)\))?\s*\{(.*)\}", entry_text, re.DOTALL)
-        if switch_match is not None:
-            field_name = switch_match.group(1)
-            field = field_by_name.get(field_name)
-            if field is None:
-                raise ValueError(f"Unknown SOA field {soa_def.name}.{field_name} in {block.file}")
-            if field.kind != "switch":
-                raise ValueError(f"SOA regular field {soa_def.name}.{field_name} requires an assignment in {block.file}")
-            params_expr = (switch_match.group(2) or "").strip()
-            if params_expr != field.params_expr:
-                raise ValueError(
-                    f"SOA switch body {soa_def.name}.{field_name} in {block.file} must match declared parameter list "
-                    f"({field.params_expr!r})"
-                )
-            if field_name in switch_bodies:
-                raise ValueError(f"Duplicate SOA switch body for {soa_def.name}.{field_name} in {block.file}")
-            switch_bodies[field_name] = switch_match.group(3).strip()
-            continue
-
-        raise ValueError(f"Invalid SOA row entry {entry_text!r} in {block.file}")
-
-    return BuiltinSoaRow(
-        soa_name=soa_def.name,
-        name=row_name,
-        file=block.file,
-        assignments=assignments,
-        switch_bodies=switch_bodies,
-    )
-
-
-def collect_builtin_soa_inventory(
-    shared_dir: Path,
-    source_suffixes: tuple[str, ...],
-    generated_header_root: str,
-    generated_header_prefix: str,
-) -> tuple[dict[str, BuiltinSoaDef], dict[str, list[BuiltinSoaRow]]]:
-    raw_blocks: list[MarkerBlock] = []
-    for file in iter_source_files(shared_dir, source_suffixes):
-        source = file.read_text()
-        for start in marker_positions(source):
-            end = block_end(source, start)
-            text = source[start + MARKER_LEN:end]
-            raw_blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
-
-    soa_defs: dict[str, BuiltinSoaDef] = {}
-    for block in raw_blocks:
-        soa_def = parse_builtin_soa_definition_block(block, generated_header_root, generated_header_prefix)
-        if soa_def is None:
-            continue
-        existing = soa_defs.get(soa_def.name)
-        if existing is not None:
-            raise ValueError(f"Duplicate SOA {soa_def.name!r} in {existing.file} and {block.file}")
-        soa_defs[soa_def.name] = soa_def
-
-    rows_by_soa = {name: [] for name in soa_defs}
-    for block in expand_builtin_blocks(raw_blocks):
-        keyword = block_leading_keyword(block.text)
-        if keyword is None:
-            continue
-        if keyword == "soa":
-            continue
-        soa_def = soa_defs.get(keyword)
-        if soa_def is None:
-            continue
-        rows_by_soa[keyword].append(parse_builtin_soa_row_block(block, soa_def))
-
-    return soa_defs, rows_by_soa
-
-
-def builtin_soa_descriptor_path(build_root: Path, soa_name: str) -> Path:
-    return build_root / f"builtin_soa_{soa_name}.json"
-
-
-def write_builtin_soa_descriptor(build_root: Path, soa_def: BuiltinSoaDef) -> None:
-    descriptor = {
-        "name": soa_def.name,
-        "source_file": str(soa_def.file),
-        "include_path": soa_def.include_path,
-        "generated_rel_path": soa_def.generated_rel_path,
-        "fields": [
-            {
-                "kind": field.kind,
-                "type_expr": field.type_expr,
-                "name": field.name,
-                "default_expr": field.default_expr,
-                "params_expr": field.params_expr,
-                "param_names": field.param_names,
-            }
-            for field in soa_def.fields
-        ],
-    }
-    write_text_if_changed(builtin_soa_descriptor_path(build_root, soa_def.name), stable_json_dumps(descriptor) + "\n")
-
-
-def load_builtin_soa_defs_from_build_root(build_root: Path) -> dict[str, BuiltinSoaDef]:
-    soa_defs: dict[str, BuiltinSoaDef] = {}
-    for path in sorted(build_root.glob("builtin_soa_*.json")):
-        data = json.loads(path.read_text())
-        soa_defs[data["name"]] = BuiltinSoaDef(
-            name=data["name"],
-            file=Path(data["source_file"]),
-            include_path=data["include_path"],
-            generated_rel_path=data.get("generated_rel_path", data["include_path"]),
-            fields=[
-                BuiltinSoaField(
-                    kind=field["kind"],
-                    type_expr=field["type_expr"],
-                    name=field["name"],
-                    default_expr=field.get("default_expr", ""),
-                    params_expr=field.get("params_expr", ""),
-                    param_names=list(field.get("param_names", [])),
-                )
-                for field in data.get("fields", [])
-            ],
-        )
-    return soa_defs
-
-
-def remove_stale_builtin_soa_artifacts(build_root: Path, output_root: Path | None, active_defs: dict[str, BuiltinSoaDef]) -> None:
-    build_root.mkdir(parents=True, exist_ok=True)
-    active_descriptor_names = {f"builtin_soa_{name}.json" for name in active_defs}
-    for path in build_root.glob("builtin_soa_*.json"):
-        if path.name in active_descriptor_names:
-            continue
-        generated_rel_path = None
-        try:
-            data = json.loads(path.read_text())
-            generated_rel_path = data.get("generated_rel_path")
-        except Exception:
-            generated_rel_path = None
-        path.unlink()
-        if generated_rel_path and output_root is not None:
-            generated_path = output_root / generated_rel_path
-            if generated_path.exists():
-                generated_path.unlink()
-
-
-def render_builtin_soa_header(soa_def: BuiltinSoaDef, rows: list[BuiltinSoaRow]) -> str:
-    regular_fields = [field for field in soa_def.fields if field.kind == "regular"]
-    switch_fields = [field for field in soa_def.fields if field.kind == "switch"]
-
-    lines: list[str] = ["#pragma once", ""]
-    lines.append(f"namespace {soa_def.name}_soa {{")
-    lines.append(f"static constexpr uint16 count = {len(rows) + 1};")
-    for field in regular_fields:
-        values = [field.default_expr]
-        for row in rows:
-            values.append(row.assignments.get(field.name, field.default_expr))
-        joined_values = ", ".join(values)
-        lines.append(f"static constexpr {field.type_expr} {field.name}_by_id[count] = {{ {joined_values} }};")
-    lines.append("}")
-    lines.append("")
-
-    for field in regular_fields:
-        lines.append(f"inline {field.type_expr} {soa_def.name}_{field.name}_from_id(uint16 id) {{")
-        lines.append(f"if (id < {soa_def.name}_soa::count) {{")
-        lines.append(f"return {soa_def.name}_soa::{field.name}_by_id[id];")
-        lines.append("}")
-        lines.append(f"return {field.default_expr};")
-        lines.append("}")
-        lines.append("")
-
-    for field in switch_fields:
-        params_suffix = f", {field.params_expr}" if field.params_expr else ""
-        lines.append(f"inline void {soa_def.name}_{field.name}_from_id(uint16 id{params_suffix}) {{")
-        lines.append("switch (id) {")
-        for index, row in enumerate(rows, start=1):
-            body = row.switch_bodies.get(field.name)
-            if body is None:
-                continue
-            lines.append(f"case {index}: {{")
-            if body:
-                lines.append(body)
-            lines.append("break;")
-            lines.append("}")
-        lines.append("default:")
-        lines.append("break;")
-        lines.append("}")
-        lines.append("}")
-        lines.append("")
-
-    lines.append(f"struct {soa_def.name} {{")
-    lines.append("static constexpr uint16 invalid_id = 0;")
-    lines.append("uint16 id;")
-    lines.append(f"constexpr {soa_def.name}() : id(invalid_id) {{}}")
-    lines.append(f"constexpr {soa_def.name}(uint16 id_value) : id(id_value) {{}}")
-    lines.append(f"constexpr bool operator==(const {soa_def.name}& other) const {{ return id == other.id; }}")
-    lines.append(f"constexpr bool operator!=(const {soa_def.name}& other) const {{ return id != other.id; }}")
-    lines.append("constexpr bool valid() const { return id != invalid_id; }")
-    for field in regular_fields:
-        lines.append(f"{field.type_expr} get_{field.name}() const {{ return {soa_def.name}_{field.name}_from_id(id); }}")
-    for field in switch_fields:
-        params_decl = field.params_expr
-        args = ", ".join(field.param_names)
-        call_suffix = f", {args}" if args else ""
-        lines.append(f"void {field.name}({params_decl}) const {{ {soa_def.name}_{field.name}_from_id(id{call_suffix}); }}")
-    lines.append("};")
-    if rows:
-        lines.append("")
-        for index, row in enumerate(rows, start=1):
-            lines.append(f"static constexpr {soa_def.name} {soa_def.name}_{row.name} = {{ {index} }};")
-    lines.append("")
-    return format_cpp_like("\n".join(lines))
-
-
-def write_builtin_soa_headers(output_root: Path, soa_defs: dict[str, BuiltinSoaDef], rows_by_soa: dict[str, list[BuiltinSoaRow]]) -> list[Path]:
-    written_paths: list[Path] = []
-    for soa_name, soa_def in soa_defs.items():
-        out_path = output_root / soa_def.generated_rel_path
-        content = render_builtin_soa_header(soa_def, rows_by_soa.get(soa_name, []))
-        if write_text_if_changed(out_path, content):
-            print(f"Written: {out_path}")
-        written_paths.append(out_path)
-    return written_paths
-
-
-def filter_builtin_blocks(blocks: list[MarkerBlock], raw_blocks: list[MarkerBlock], soa_defs: dict[str, BuiltinSoaDef]) -> list[MarkerBlock]:
-    for block in raw_blocks:
-        soa_def = parse_builtin_soa_definition_block(block, "", "")
-        if soa_def is not None:
-            descriptor = soa_defs.get(soa_def.name)
-            if descriptor is None:
-                raise ValueError(f"Unknown SOA {soa_def.name!r} referenced in {block.file}")
-            block.replacement = f'#include "{descriptor.include_path}"'
-            continue
-
-        keyword = block_leading_keyword(block.text)
-        if keyword is not None and keyword in soa_defs:
-            block.replacement = ""
-
-    filtered: list[MarkerBlock] = []
-    for block in blocks:
-        keyword = block_leading_keyword(block.text)
-        if keyword == "soa":
-            continue
-        if keyword is not None and keyword in soa_defs:
-            continue
-        filtered.append(block)
-    return filtered
-
-
 def iter_source_files(shared_dir: Path, source_suffixes: tuple[str, ...]) -> list[Path]:
     suffixes = {suffix.lower() for suffix in source_suffixes}
     return [
@@ -1925,24 +1585,17 @@ def iter_source_files(shared_dir: Path, source_suffixes: tuple[str, ...]) -> lis
 def discover_blocks(
     shared_dir: Path,
     source_suffixes: tuple[str, ...],
-    soa_defs: dict[str, BuiltinSoaDef] | None = None,
 ) -> tuple[list[MarkerBlock], dict[Path, list[MarkerBlock]]]:
     raw_blocks = []
     strip_blocks: dict[Path, list[MarkerBlock]] = {}
 
     for file in iter_source_files(shared_dir, source_suffixes):
         source = file.read_text()
-        positions = marker_positions(source)
-        for index, start in enumerate(positions):
-            end = block_end(source, start)
-            text = source[start + MARKER_LEN:end]
-            block = MarkerBlock(file=file, start=start, end=end, text=text)
-            raw_blocks.append(block)
-            strip_blocks.setdefault(file, []).append(block)
+        file_blocks = parse_marker_blocks_from_source(source, file)
+        raw_blocks.extend(file_blocks)
+        strip_blocks.setdefault(file, []).extend(file_blocks)
 
     expanded_blocks = expand_builtin_blocks(raw_blocks)
-    if soa_defs:
-        expanded_blocks = filter_builtin_blocks(expanded_blocks, raw_blocks, soa_defs)
     return expanded_blocks, strip_blocks
 
 
@@ -1950,10 +1603,9 @@ def collect_instances_by_pass(
     shared_dir: Path,
     pass_defs: dict[str, PassDef],
     source_suffixes: tuple[str, ...],
-    soa_defs: dict[str, BuiltinSoaDef] | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     instances_by_pass = {name: [] for name in pass_defs}
-    blocks, _ = discover_blocks(shared_dir, source_suffixes, soa_defs)
+    blocks, _ = discover_blocks(shared_dir, source_suffixes)
     for block in blocks:
         stripped = block.text.lstrip()
         if stripped.startswith("pass"):
@@ -2652,6 +2304,13 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
         text = re.sub(r"_+", "_", text).strip("_")
         return text or "0"
 
+    def replace(text, old, new):
+        return str(text).replace(str(old), str(new))
+
+    def cpp_string_literal(text):
+        escaped = str(text).replace("\\", "\\\\").replace('"', '\\"')
+        return f"\"{escaped}\""
+
     translated = re.sub(r"\b([A-Za-z_]\w*)\+\+", lambda m: f'__post_inc__("{m.group(1)}")', expr)
     safe_builtins = {
         "__import__": __import__,
@@ -2674,6 +2333,8 @@ def render_python_expr(expr: str, fields: dict[str, str], counters: dict, helper
     scope.update(helper_functions)
     scope.update(safe_builtins)
     scope["identifier_suffix"] = identifier_suffix
+    scope["replace"] = replace
+    scope["cpp_string_literal"] = cpp_string_literal
     scope["__post_inc__"] = post_inc
     import_paths = []
     cwd = Path.cwd().resolve()
@@ -3168,6 +2829,10 @@ def execute_instance_ops(
     external_pass_defs: dict[str, PassDef] | None = None,
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
+    top_level_emissions: list[MarkerBlock] | None = None,
+    top_level_phase: str | None = None,
+    top_level_passes_allowed: bool = False,
+    top_level_producer: str | None = None,
 ) -> None:
     helper_functions: dict[str, object] = dict(pass_def.init_vars)
     helper_functions.update(pass_def.local_func_defs)
@@ -3231,6 +2896,10 @@ def execute_instance_ops(
                     external_pass_index_bases,
                     external_pass_generated_counts,
                     op.arg_overrides,
+                    top_level_emissions,
+                    top_level_phase,
+                    top_level_passes_allowed,
+                    top_level_producer,
                 )
             else:
                 input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
@@ -3249,11 +2918,35 @@ def execute_instance_ops(
                     external_pass_index_bases,
                     external_pass_generated_counts,
                     op.arg_overrides,
+                    top_level_emissions,
+                    top_level_phase,
+                    top_level_passes_allowed,
+                    top_level_producer,
                 )
             continue
 
         if op.kind == "invoke":
             if op.helper_name is None or op.input_expr is None:
+                continue
+            if op.helper_name == "top_level":
+                if top_level_emissions is None or top_level_phase is None:
+                    raise ValueError("top_level[...] is not available in this execution context")
+                input_text = render_template(op.input_expr, template_fields(), counters, helper_functions)
+                emitted_blocks = parse_virtual_top_level_blocks(
+                    input_text,
+                    top_level_phase,
+                    top_level_producer or op.helper_name,
+                )
+                if not top_level_passes_allowed:
+                    pass_blocks = [block for block in emitted_blocks if block_is_pass_declaration(block)]
+                    if pass_blocks:
+                        producer_text = (top_level_producer or op.helper_name).replace("\\", "/")
+                        if "/passes/" not in producer_text:
+                            raise ValueError(
+                                f"top_level[...] in {top_level_producer or op.helper_name} during {top_level_phase} "
+                                "may not emit $pass blocks"
+                            )
+                top_level_emissions.extend(emitted_blocks)
                 continue
             if external_pass_defs is None:
                 raise ValueError(f"External pass invocation is not available for {op.helper_name!r}")
@@ -3276,6 +2969,10 @@ def execute_instance_ops(
                 external_pass_index_bases,
                 external_pass_generated_counts,
                 op.arg_overrides,
+                top_level_emissions,
+                top_level_phase,
+                top_level_passes_allowed,
+                top_level_producer,
             )
             continue
 
@@ -3325,6 +3022,10 @@ def execute_instance_ops(
                     external_pass_defs,
                     external_pass_index_bases,
                     external_pass_generated_counts,
+                    top_level_emissions,
+                    top_level_phase,
+                    top_level_passes_allowed,
+                    top_level_producer,
                 )
             continue
 
@@ -3346,6 +3047,10 @@ def execute_named_pass(
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
     arg_override_exprs: dict[str, str] | None = None,
+    top_level_emissions: list[MarkerBlock] | None = None,
+    top_level_phase: str | None = None,
+    top_level_passes_allowed: bool = False,
+    top_level_producer: str | None = None,
 ) -> None:
     import copy
 
@@ -3464,6 +3169,10 @@ def execute_named_pass(
                 external_pass_defs,
                 external_pass_index_bases,
                 external_pass_generated_counts,
+                top_level_emissions,
+                top_level_phase,
+                top_level_passes_allowed,
+                top_level_producer,
             )
             local_index += 1
     finally:
@@ -3485,6 +3194,10 @@ def execute_pass_instance_helper(
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
     arg_override_exprs: dict[str, str] | None = None,
+    top_level_emissions: list[MarkerBlock] | None = None,
+    top_level_phase: str | None = None,
+    top_level_passes_allowed: bool = False,
+    top_level_producer: str | None = None,
 ) -> None:
     import copy
 
@@ -3534,6 +3247,10 @@ def execute_pass_instance_helper(
             external_pass_defs,
             external_pass_index_bases,
             external_pass_generated_counts,
+            top_level_emissions,
+            top_level_phase,
+            top_level_passes_allowed,
+            top_level_producer,
         )
 
 
@@ -3546,6 +3263,10 @@ def render_fragments(
     external_pass_defs: dict[str, PassDef] | None = None,
     external_pass_index_bases: dict[str, int] | None = None,
     external_pass_generated_counts: dict[str, int] | None = None,
+    top_level_emissions: list[MarkerBlock] | None = None,
+    top_level_phase: str | None = None,
+    top_level_passes_allowed: bool = False,
+    top_level_producer: str | None = None,
 ) -> dict[str, str]:
     import copy
 
@@ -3584,7 +3305,23 @@ def render_fragments(
             counters["index"] = SymbolicExpr(f"({index_base_expr} + {index})")
         fields = resolve_pass_arg_values(pass_def, instance_fields, instance_fields, counters, helper_functions)
         bound_outputs = bind_file_arg_outputs(pass_def, fields, {}, accs)
-        execute_instance_ops(pass_def, fields, counters, helper_defs, bound_outputs, accs, global_pass_instances, None, external_pass_defs, external_pass_index_bases, external_pass_generated_counts)
+        execute_instance_ops(
+            pass_def,
+            fields,
+            counters,
+            helper_defs,
+            bound_outputs,
+            accs,
+            global_pass_instances,
+            None,
+            external_pass_defs,
+            external_pass_index_bases,
+            external_pass_generated_counts,
+            top_level_emissions,
+            top_level_phase,
+            top_level_passes_allowed,
+            top_level_producer,
+        )
 
     fragments = {}
     for key, value in accs.items():
@@ -3658,12 +3395,14 @@ def compile_pass_inventory(
     defines: dict[str, str],
 ) -> list[dict]:
     blocks, _ = discover_blocks(passes_dir, source_suffixes)
-    pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
+    pass_blocks = [block for block in blocks if block_is_pass_declaration(block)]
     if not pass_blocks:
         raise ValueError(f"No $pass block found under {passes_dir}")
 
     pass_blocks_by_file: dict[Path, list[MarkerBlock]] = {}
     for block in pass_blocks:
+        if block.is_virtual:
+            continue
         pass_blocks_by_file.setdefault(block.file, []).append(block)
     duplicate_files = [file for file, file_blocks in pass_blocks_by_file.items() if len(file_blocks) > 1]
     if duplicate_files:
@@ -3672,11 +3411,21 @@ def compile_pass_inventory(
 
     inventory: list[dict] = []
     callable_names: dict[str, Path] = {}
-    for block in pass_blocks:
+    pass_defs_by_id: dict[str, PassDef] = {}
+
+    def register_pass_block(block: MarkerBlock) -> None:
         pass_def = compile_pass(preprocess_pass_text(block.text, defines, block.file), block.file)
-        rel_file = block.file.relative_to(passes_dir)
-        pass_name = sanitize_path_token(rel_file.stem)
-        pass_id = pass_name
+        if block.is_virtual:
+            rel_file_text = block.file.as_posix()
+            pass_id = sanitize_path_token(pass_def.callable_name or pass_def.name or block.file.stem)
+            folder = pass_id
+        else:
+            rel_file = block.file.relative_to(passes_dir)
+            rel_file_text = rel_file.as_posix()
+            pass_id = sanitize_path_token(rel_file.stem)
+            folder = pass_id
+        if pass_id in pass_defs_by_id:
+            raise ValueError(f"Duplicate pass id {pass_id!r} from {block.file}")
         outputs = []
         output_targets = list(dict.fromkeys(pass_def.instance_targets or collect_declared_output_targets(pass_def.instance_ops)))
         for target in output_targets:
@@ -3697,13 +3446,14 @@ def compile_pass_inventory(
                 )
             callable_names[pass_def.callable_name] = block.file
 
+        pass_defs_by_id[pass_id] = pass_def
         inventory.append({
             "id": pass_id,
             "callable_name": pass_def.callable_name,
-            "defined_in": rel_file.as_posix(),
+            "defined_in": rel_file_text,
             "source_file": str(block.file),
             "block_index_in_file": 0,
-            "folder": pass_name,
+            "folder": folder,
             "outputs": outputs,
             "output_targets": output_targets,
             "pass_text": block.text.strip(),
@@ -3711,6 +3461,58 @@ def compile_pass_inventory(
             "local_pass_count": len(pass_def.local_helper_defs),
         })
 
+    for block in pass_blocks:
+        if block.is_virtual:
+            continue
+        register_pass_block(block)
+
+    external_pass_defs = {
+        pass_def.callable_name: pass_def
+        for pass_def in pass_defs_by_id.values()
+        if pass_def.callable_name is not None
+    }
+    external_pass_generated_counts: dict[str, int] = {}
+    local_count_by_pass_id = zero_count_map(list(pass_defs_by_id))
+    queue = [block for block in blocks if not block_is_pass_declaration(block)]
+    queue_index = 0
+    while queue_index < len(queue):
+        block = queue[queue_index]
+        if block_is_pass_declaration(block):
+            register_pass_block(block)
+            external_pass_defs = {
+                pass_def.callable_name: pass_def
+                for pass_def in pass_defs_by_id.values()
+                if pass_def.callable_name is not None
+            }
+            queue_index += 1
+            continue
+
+        pass_id, values = identify_pass(block, pass_defs_by_id)
+        pass_def = pass_defs_by_id[pass_id]
+        emitted_blocks: list[MarkerBlock] = []
+        external_pass_index_bases = {
+            candidate_def.callable_name: local_count_by_pass_id.get(candidate_id, 0)
+            for candidate_id, candidate_def in pass_defs_by_id.items()
+            if candidate_def.callable_name is not None
+        }
+        render_fragments(
+            pass_def,
+            [values],
+            pass_def.local_helper_defs,
+            str(local_count_by_pass_id.get(pass_id, 0)),
+            None,
+            external_pass_defs,
+            external_pass_index_bases,
+            external_pass_generated_counts,
+            emitted_blocks,
+            "compile-passes",
+            True,
+            f"{block.file.as_posix()}::{pass_def.callable_name or pass_id}",
+        )
+        local_count_by_pass_id[pass_id] = local_count_by_pass_id.get(pass_id, 0) + 1
+        if emitted_blocks:
+            queue[queue_index + 1:queue_index + 1] = emitted_blocks
+        queue_index += 1
     return inventory
 
 
@@ -3748,17 +3550,10 @@ def remove_stale_pass_artifacts(build_root: Path, active_ids: set[str]) -> None:
             print(f"Removed stale pass artifact: {path}")
 
 
-def discover_blocks_in_file(file: Path, soa_defs: dict[str, BuiltinSoaDef] | None = None) -> tuple[list[MarkerBlock], list[MarkerBlock], str]:
+def discover_blocks_in_file(file: Path) -> tuple[list[MarkerBlock], list[MarkerBlock], str]:
     source = file.read_text()
-    raw_blocks: list[MarkerBlock] = []
-    positions = marker_positions(source)
-    for start in positions:
-        end = block_end(source, start)
-        text = source[start + MARKER_LEN:end]
-        raw_blocks.append(MarkerBlock(file=file, start=start, end=end, text=text))
+    raw_blocks = parse_marker_blocks_from_source(source, file)
     expanded_blocks = expand_builtin_blocks(raw_blocks)
-    if soa_defs:
-        expanded_blocks = filter_builtin_blocks(expanded_blocks, raw_blocks, soa_defs)
     return expanded_blocks, raw_blocks.copy(), source
 
 
@@ -4328,50 +4123,10 @@ def main(argv: list[str] | None = None) -> int:
         for entry in entries:
             descriptor_path = args.build_root / f"pass_{entry['id']}.json"
             write_pass_descriptor(descriptor_path, entry)
-        soa_defs: dict[str, BuiltinSoaDef] = {}
-        rows_by_soa: dict[str, list[BuiltinSoaRow]] = {}
-        if args.shared_dir is not None and args.output_root is not None:
-            soa_defs, rows_by_soa = collect_builtin_soa_inventory(
-                args.shared_dir.resolve(),
-                source_suffixes,
-                args.generated_header_root,
-                args.generated_header_prefix,
-            )
-        remove_stale_builtin_soa_artifacts(
-            args.build_root.resolve(),
-            args.output_root.resolve() if args.output_root is not None else None,
-            soa_defs,
-        )
-        for soa_def in soa_defs.values():
-            write_builtin_soa_descriptor(args.build_root.resolve(), soa_def)
         if args.shared_dir is not None and args.output_root is not None:
             write_public_output_headers(entries, args.output_root.resolve())
-            write_builtin_soa_headers(args.output_root.resolve(), soa_defs, rows_by_soa)
         if args.stamp is not None:
-            soa_stamp_entries = [
-                {
-                    "name": soa_def.name,
-                    "include_path": soa_def.include_path,
-                    "generated_rel_path": soa_def.generated_rel_path,
-                    "fields": [
-                        {
-                            "kind": field.kind,
-                            "type_expr": field.type_expr,
-                            "name": field.name,
-                            "default_expr": field.default_expr,
-                            "params_expr": field.params_expr,
-                            "param_names": field.param_names,
-                        }
-                        for field in soa_def.fields
-                    ],
-                    "row_count": len(rows_by_soa.get(soa_def.name, [])),
-                }
-                for soa_def in soa_defs.values()
-            ]
-            stamp_payload = {
-                "passes": entries,
-                "builtin_soa": soa_stamp_entries,
-            }
+            stamp_payload = {"passes": entries}
             write_stamp_if_changed(args.stamp.resolve(), hash_text(stable_json_dumps(stamp_payload)))
         return 0
     if args.command == "process-file":
@@ -4386,26 +4141,16 @@ def main(argv: list[str] | None = None) -> int:
         rel_from_shared_parent = input_file.relative_to(shared_root.parent)
         rel_from_shared_root = input_file.relative_to(shared_root)
         loaded_passes = load_pass_defs_from_build_root(build_root)
-        loaded_soa_defs = load_builtin_soa_defs_from_build_root(build_root)
-        blocks, strip_blocks, source = discover_blocks_in_file(input_file, loaded_soa_defs)
+        blocks, strip_blocks, source = discover_blocks_in_file(input_file)
 
         pass_ids = [entry["id"] for entry, _ in loaded_passes]
+        entry_by_pass_id = {entry["id"]: entry for entry, _ in loaded_passes}
         pass_defs = {entry["id"]: pass_def for entry, pass_def in loaded_passes}
         external_pass_defs = {
             pass_def.callable_name: pass_def
             for _, pass_def in loaded_passes
             if pass_def.callable_name is not None
         }
-        instances_by_pass = {entry["id"]: [] for entry, _ in loaded_passes}
-
-        for block in blocks:
-            stripped = block.text.lstrip()
-            if stripped.startswith("pass"):
-                block.replacement = ""
-                continue
-
-            pass_id, values = identify_pass(block, pass_defs)
-            instances_by_pass[pass_id].append(values)
 
         source_file_index = rel_source_files.index(rel_from_shared_root)
         prev_rel_file = rel_source_files[source_file_index - 1] if source_file_index > 0 else None
@@ -4461,17 +4206,7 @@ def main(argv: list[str] | None = None) -> int:
                 shared_root,
                 pass_defs,
                 tuple(DEFAULT_SOURCE_SUFFIXES),
-                loaded_soa_defs,
             )
-
-        external_pass_index_bases = {
-            pass_def.callable_name: (
-                prefix_count_by_pass_id[entry["id"]] +
-                len(instances_by_pass[entry["id"]])
-            )
-            for entry, pass_def in loaded_passes
-            if pass_def.callable_name is not None
-        }
 
         stripped_out = strip_marker_blocks(source, strip_blocks)
         shared_out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4479,18 +4214,46 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Written: {shared_out_path}")
 
         rendered_fragments_by_pass: dict[str, dict[str, str]] = {entry["id"]: {} for entry, _ in loaded_passes}
-        for entry, pass_def in loaded_passes:
-            index_base = prefix_count_by_pass_id[entry["id"]]
+        local_count_by_pass_id = zero_count_map(pass_ids)
+        queue = list(blocks)
+        queue_index = 0
+        while queue_index < len(queue):
+            block = queue[queue_index]
+            if block_is_pass_declaration(block):
+                if not block.is_virtual:
+                    block.replacement = ""
+                queue_index += 1
+                continue
+
+            pass_id, values = identify_pass(block, pass_defs)
+            entry = entry_by_pass_id[pass_id]
+            pass_def = pass_defs[pass_id]
+            emitted_blocks: list[MarkerBlock] = []
+            external_pass_index_bases = {
+                candidate_def.callable_name: (
+                    prefix_count_by_pass_id.get(candidate_id, 0) +
+                    local_count_by_pass_id.get(candidate_id, 0)
+                )
+                for candidate_id, candidate_def in pass_defs.items()
+                if candidate_def.callable_name is not None
+            }
             rendered = render_fragments(
                 pass_def,
-                instances_by_pass[entry["id"]],
+                [values],
                 pass_def.local_helper_defs,
-                str(index_base),
+                str(prefix_count_by_pass_id[pass_id] + local_count_by_pass_id[pass_id]),
                 global_instances_by_pass,
                 external_pass_defs,
                 external_pass_index_bases,
                 external_pass_generated_counts,
+                emitted_blocks,
+                "process-file",
+                False,
+                f"{block.file.as_posix()}::{pass_def.callable_name or pass_id}",
             )
+            local_count_by_pass_id[pass_id] = local_count_by_pass_id.get(pass_id, 0) + 1
+            if emitted_blocks:
+                queue[queue_index + 1:queue_index + 1] = emitted_blocks
             for fragment_name, content in rendered.items():
                 owner_pass_id = output_owner_by_fragment.get(fragment_name)
                 if owner_pass_id is None:
@@ -4499,6 +4262,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 existing = rendered_fragments_by_pass[owner_pass_id].get(fragment_name, "")
                 rendered_fragments_by_pass[owner_pass_id][fragment_name] = existing + content
+            queue_index += 1
 
         callable_name_to_pass_id = {
             pass_def.callable_name: entry["id"]
@@ -4517,18 +4281,18 @@ def main(argv: list[str] | None = None) -> int:
                 entry,
                 pass_def,
                 rel_from_shared_root,
-                instances_by_pass[entry["id"]],
+                [],
                 shared_output_root,
                 build_root,
                 rel_source_files,
                 global_instances_by_pass,
                 external_pass_defs,
                 rendered_fragments_by_pass[entry["id"]],
-                len(instances_by_pass[entry["id"]]) + generated_count_by_pass_id.get(entry["id"], 0),
+                local_count_by_pass_id.get(entry["id"], 0) + generated_count_by_pass_id.get(entry["id"], 0),
             )
 
         local_count_by_pass_id = {
-            entry["id"]: len(instances_by_pass[entry["id"]]) + generated_count_by_pass_id.get(entry["id"], 0)
+            entry["id"]: local_count_by_pass_id.get(entry["id"], 0) + generated_count_by_pass_id.get(entry["id"], 0)
             for entry, _ in loaded_passes
         }
         cumulative_count_by_pass_id = {
@@ -4547,8 +4311,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.stamp is not None:
             write_stamp_if_changed(args.stamp.resolve(), state_fingerprint)
 
-        matched_pass_count = sum(1 for instances in instances_by_pass.values() if instances)
-        total_instances = sum(len(instances) for instances in instances_by_pass.values())
         return 0
     if args.command == "assemble-pass":
         entry = load_pass_entry(args.build_root.resolve(), args.pass_id)
@@ -4575,13 +4337,7 @@ def main(argv: list[str] | None = None) -> int:
     stamp_path = args.stamp or (output_root / "content.stamp")
     source_suffixes = tuple(dict.fromkeys(args.source_suffixes))
 
-    legacy_soa_defs, _ = collect_builtin_soa_inventory(
-        shared_dir,
-        source_suffixes,
-        args.generated_header_root,
-        args.generated_header_prefix,
-    )
-    blocks, strip_map = discover_blocks(shared_dir, source_suffixes, legacy_soa_defs)
+    blocks, strip_map = discover_blocks(shared_dir, source_suffixes)
     pass_blocks = [block for block in blocks if block.text.lstrip().startswith("pass")]
     if not pass_blocks:
         raise ValueError(f"No $pass block found under {shared_dir}")
@@ -4608,7 +4364,7 @@ def main(argv: list[str] | None = None) -> int:
     local_helper_count = sum(len(pass_def.local_helper_defs) for pass_def in pass_defs.values())
     instances_by_pass = {name: [] for name in pass_defs}
 
-    global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes, legacy_soa_defs)
+    global_instances_by_pass = collect_instances_by_pass(shared_dir, pass_defs, source_suffixes)
     for pass_name, values in global_instances_by_pass.items():
         instances_by_pass.setdefault(pass_name, [])
         instances_by_pass[pass_name].extend(values)
@@ -4650,12 +4406,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Written: {out_path}")
 
     write_generated_sources(shared_dir, strip_map, shared_output_root, source_suffixes)
-    write_builtin_soa_headers(output_root, legacy_soa_defs, collect_builtin_soa_inventory(
-        shared_dir,
-        source_suffixes,
-        args.generated_header_root,
-        args.generated_header_prefix,
-    )[1])
     stamp_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_path.write_text("# Generated by codegen\n")
     print(f"Written: {stamp_path}")
