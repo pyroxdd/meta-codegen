@@ -1630,6 +1630,8 @@ def identify_pass(block: MarkerBlock, pass_defs: dict[str, PassDef]) -> tuple[st
             values = parse_instance(block, pass_def)
         except ValueError:
             continue
+        values = dict(values)
+        values["block_virtual"] = "1" if block.is_virtual else "0"
         matches.append((name, values))
 
     if not matches:
@@ -3471,6 +3473,7 @@ def compile_pass_inventory(
         for pass_def in pass_defs_by_id.values()
         if pass_def.callable_name is not None
     }
+    global_pass_instances = collect_instances_by_pass(passes_dir, pass_defs_by_id, source_suffixes)
     external_pass_generated_counts: dict[str, int] = {}
     local_count_by_pass_id = zero_count_map(list(pass_defs_by_id))
     queue = [block for block in blocks if not block_is_pass_declaration(block)]
@@ -3484,6 +3487,7 @@ def compile_pass_inventory(
                 for pass_def in pass_defs_by_id.values()
                 if pass_def.callable_name is not None
             }
+            global_pass_instances = collect_instances_by_pass(passes_dir, pass_defs_by_id, source_suffixes)
             queue_index += 1
             continue
 
@@ -3500,7 +3504,7 @@ def compile_pass_inventory(
             [values],
             pass_def.local_helper_defs,
             str(local_count_by_pass_id.get(pass_id, 0)),
-            None,
+            global_pass_instances,
             external_pass_defs,
             external_pass_index_bases,
             external_pass_generated_counts,
